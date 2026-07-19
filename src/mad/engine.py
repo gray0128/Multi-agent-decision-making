@@ -9,6 +9,7 @@ from pathlib import Path
 
 from .adapters import AdapterError, CliAdapter, PreflightResult
 from .archive import Archive
+from .context import estimate_tokens
 from .disputes import parse_dispute_list, parse_revision, raw_union
 from .models import AgentProfile, CheckpointDecision, Contribution, DeliberationRequest, RunResult, Stage
 from .snapshot import create_snapshot
@@ -115,6 +116,8 @@ class DeliberationEngine:
                     "独立分析问题。明确结论、理由、假设、风险与资料来源，不参考其他参与者。",
                     workdir,
                     progress,
+                    context_profiles=selected,
+                    summary_agent=report_agent,
                 )
                 await self._checkpoint_after_stage(state, archive, Stage.OPENING, opening, checkpoint)
 
@@ -128,6 +131,8 @@ class DeliberationEngine:
                     "阅读已有陈述，指出事实错误、遗漏、冲突和最强反例，并给出补充。",
                     workdir,
                     progress,
+                    context_profiles=selected,
+                    summary_agent=report_agent,
                 )
                 await self._checkpoint_after_stage(state, archive, Stage.CRITIQUE, critique, checkpoint)
 
@@ -145,6 +150,8 @@ class DeliberationEngine:
                     workdir,
                     progress,
                     parse_revision_signal=True,
+                    context_profiles=selected,
+                    summary_agent=report_agent,
                 )
             if not state.stage_completed(Stage.DISPUTE_DECISION):
                 revisions = state.stage_items(Stage.REVISION)
@@ -184,6 +191,8 @@ class DeliberationEngine:
                     self._report_instruction(final=False),
                     workdir,
                     progress,
+                    context_profiles=selected,
+                    summary_agent=report_agent,
                 )
                 await self._checkpoint_after_stage(state, archive, Stage.DRAFT, [draft], checkpoint)
 
@@ -199,6 +208,8 @@ class DeliberationEngine:
                     workdir,
                     progress,
                     minimum_success=1,
+                    context_profiles=selected,
+                    summary_agent=report_agent,
                 )
 
             if not state.stage_completed(Stage.FINAL):
@@ -211,6 +222,8 @@ class DeliberationEngine:
                     self._report_instruction(final=True),
                     workdir,
                     progress,
+                    context_profiles=selected,
+                    summary_agent=report_agent,
                 )
 
             final_items = state.stage_items(Stage.FINAL)
@@ -319,8 +332,19 @@ class DeliberationEngine:
         *,
         parse_revision_signal=False,
         minimum_success=2,
+        context_profiles,
+        summary_agent,
     ):
-        prompt = self._persisted_stage_input(state, request, stage, instruction)
+        prompt = await self._stage_input(
+            state,
+            request,
+            stage,
+            instruction,
+            context_profiles,
+            summary_agent,
+            workdir,
+            archive,
+        )
         state.begin_stage(stage, prompt)
         archive.save_state(state)
         progress(f"开始阶段：{stage.value}")
@@ -339,8 +363,30 @@ class DeliberationEngine:
         self._commit_stage(state, archive, stage, results)
         return results
 
-    async def _run_single_stage(self, state, archive, profile, request, stage, instruction, workdir, progress):
-        prompt = self._persisted_stage_input(state, request, stage, instruction)
+    async def _run_single_stage(
+        self,
+        state,
+        archive,
+        profile,
+        request,
+        stage,
+        instruction,
+        workdir,
+        progress,
+        *,
+        context_profiles,
+        summary_agent,
+    ):
+        prompt = await self._stage_input(
+            state,
+            request,
+            stage,
+            instruction,
+            context_profiles,
+            summary_agent,
+            workdir,
+            archive,
+        )
         state.begin_stage(stage, prompt)
         archive.save_state(state)
         progress(f"开始阶段：{stage.value}")
@@ -366,11 +412,102 @@ class DeliberationEngine:
             }
         )
 
-    def _persisted_stage_input(self, state, request, stage, instruction):
+    async def _stage_input(
+        self,
+        state,
+        request,
+        stage,
+        instruction,
+        context_profiles,
+        summary_agent,
+        workdir,
+        archive,
+    ):
         value = stage.value if isinstance(stage, Stage) else stage
         if state.active_stage == value and value in state.stage_inputs:
             return state.stage_inputs[value]
-        return self._prompt(request, instruction, state.contributions(), state.guidance)
+        prompt = self._prompt(
+            request,
+            instruction,
+            state.contributions(),
+            state.guidance,
+            summary=state.summary,
+        )
+        estimates = self._budget_estimates(prompt, request.roles, context_profiles)
+        if not self._over_budget(estimates, context_profiles):
+            return prompt
+        if not state.transcript:
+            raise DeliberationError(f"{value}基础提示已超过参与者上下文预算，且没有可摘要的审议记录")
+        state.begin_stage(stage)
+        archive.save_state(state)
+        target_tokens = max(32, min(profile.context_budget for profile in context_profiles) // 2)
+        summary_prompt = self._summary_prompt(
+            request,
+            state.contributions(),
+            state.guidance,
+            target_tokens=target_tokens,
+        )
+        summary_input_tokens = estimate_tokens(
+            self._with_role(summary_prompt, request.roles.get(summary_agent.id, ""))
+        )
+        if summary_input_tokens > summary_agent.context_budget:
+            raise DeliberationError(
+                f"统一审议摘要输入超过报告 Agent 上下文预算（{summary_input_tokens} > "
+                f"{summary_agent.context_budget}），审议已暂停"
+            )
+        try:
+            contribution = await self._one(
+                summary_agent,
+                self._with_role(summary_prompt, request.roles.get(summary_agent.id, "")),
+                workdir,
+                Stage.SUMMARY,
+                archive,
+            )
+        except DeliberationError as exc:
+            raise DeliberationError(f"统一审议摘要生成失败，审议已暂停：{exc}") from exc
+        if not contribution.text.strip():
+            raise DeliberationError("统一审议摘要为空，审议已暂停")
+        state.summary = {
+            "text": contribution.text,
+            "through_count": len(state.transcript),
+            "trigger_stage": value,
+            "estimated_tokens_before": estimates,
+            "summary_input_tokens": summary_input_tokens,
+        }
+        compact_prompt = self._prompt(
+            request,
+            instruction,
+            state.contributions(),
+            state.guidance,
+            summary=state.summary,
+        )
+        compact_estimates = self._budget_estimates(compact_prompt, request.roles, context_profiles)
+        state.summary["estimated_tokens_after"] = compact_estimates
+        archive.save_state(state)
+        archive.event(
+            {
+                "type": "context_summary",
+                "stage": value,
+                "through_count": len(state.transcript),
+                "estimated_tokens_before": estimates,
+                "estimated_tokens_after": compact_estimates,
+                "summary_input_tokens": summary_input_tokens,
+                "text": contribution.text,
+            }
+        )
+        if self._over_budget(compact_estimates, context_profiles):
+            raise DeliberationError("统一审议摘要生成后仍超过参与者上下文预算，审议已暂停")
+        return compact_prompt
+
+    def _budget_estimates(self, prompt, roles, profiles):
+        return {
+            profile.id: estimate_tokens(self._with_role(prompt, roles.get(profile.id, "")))
+            for profile in profiles
+        }
+
+    @staticmethod
+    def _over_budget(estimates, profiles):
+        return any(estimates[profile.id] > profile.context_budget for profile in profiles)
 
     async def _checkpoint_after_stage(self, state, archive, stage, items, checkpoint):
         state.pending_checkpoint = stage.value
@@ -463,11 +600,16 @@ class DeliberationEngine:
         ]
         raw_disputes = raw_union(signals)
         if not state.stage_completed(Stage.DISPUTE_ORGANIZATION):
-            organization_prompt = state.stage_inputs.get(Stage.DISPUTE_ORGANIZATION.value)
-            if state.active_stage != Stage.DISPUTE_ORGANIZATION.value or organization_prompt is None:
-                organization_prompt = self._dispute_organization_prompt(
-                    request, state.contributions(), raw_disputes, request.convergence
-                )
+            organization_prompt = await self._stage_input(
+                state,
+                request,
+                Stage.DISPUTE_ORGANIZATION,
+                self._dispute_organization_instruction(raw_disputes, request.convergence),
+                selected,
+                report_agent,
+                workdir,
+                archive,
+            )
             state.begin_stage(Stage.DISPUTE_ORGANIZATION, organization_prompt)
             archive.save_state(state)
             progress("正在整理关键未决争议")
@@ -510,6 +652,8 @@ class DeliberationEngine:
                 workdir,
                 progress,
                 minimum_success=1,
+                context_profiles=selected,
+                summary_agent=report_agent,
             )
         if state.stage_completed(Stage.CONVERGENCE):
             convergence = state.stage_items(Stage.CONVERGENCE)
@@ -657,10 +801,40 @@ class DeliberationEngine:
             raise DeliberationError(f"{profile.name} 调用失败：{last_error}")
 
     @staticmethod
-    def _prompt(request, instruction, transcript, guidance):
-        history = "\n\n".join(f"[{item.stage.value} / {item.agent_name}]\n{item.text}" for item in transcript)
+    def _prompt(request, instruction, transcript, guidance, *, summary=None):
+        if summary and summary.get("text"):
+            through = min(int(summary.get("through_count", 0)), len(transcript))
+            incremental = "\n\n".join(
+                f"[{item.stage.value} / {item.agent_name}]\n{item.text}" for item in transcript[through:]
+            )
+            history = f"[统一审议摘要，覆盖前 {through} 条正式记录]\n{summary['text']}"
+            if incremental:
+                history += f"\n\n[摘要后的正式记录]\n{incremental}"
+        else:
+            history = "\n\n".join(
+                f"[{item.stage.value} / {item.agent_name}]\n{item.text}" for item in transcript
+            )
         notes = "\n".join(f"- {item}" for item in guidance) or "无"
         return f"""你正在参加一次只读结构化审议。不得修改文件或执行有副作用的操作。\n\n问题：\n{request.question}\n\n当前阶段要求：\n{instruction}\n\n用户指导：\n{notes}\n\n已有正式审议记录：\n{history or '暂无'}\n\n请只输出可公开给其他参与者的正式发言。"""
+
+    @staticmethod
+    def _summary_prompt(request, transcript, guidance, *, target_tokens):
+        history = "\n\n".join(
+            f"[{item.stage.value} / {item.agent_name} / {item.agent_id}]\n{item.text}" for item in transcript
+        )
+        notes = "\n".join(f"- {item}" for item in guidance) or "无"
+        return f"""你是报告 Agent。请把以下权威完整审议记录压缩成一份供所有后续参与者共同使用的统一审议摘要，目标不超过约 {target_tokens} tokens。摘要必须忠实保留：原问题、全部用户指导、关键论点及其提出者、未决与已解决争议、关键假设、风险、不确定性，以及原文中出现的可核查来源。不得新增事实、裁决争议或省略相互冲突的结论。
+
+原问题：
+{request.question}
+
+全部用户指导：
+{notes}
+
+权威完整审议记录：
+{history}
+
+只输出摘要正文。"""
 
     @staticmethod
     def _report_instruction(*, final: bool) -> str:
@@ -668,10 +842,8 @@ class DeliberationEngine:
         return f"{verb}最终报告。必须包含执行摘要、明确结论、关键理由、分歧与不确定性、可核查来源或缺少来源的说明，以及下一步行动。若存在争议收敛材料，逐项忠实归类为已解决、条件性一致或仍未解决，不得按多数投票决定。"
 
     @staticmethod
-    def _dispute_organization_prompt(request, transcript, raw_disputes, strategy):
-        history = "\n\n".join(f"[{item.agent_name}] {item.text}" for item in transcript if item.stage == Stage.REVISION)
-        return f"""你是报告 Agent，只负责整理争议，无权否决触发。问题：{request.question}
-修订意见：\n{history}
+    def _dispute_organization_instruction(raw_disputes, strategy):
+        return f"""你是报告 Agent，只负责整理争议，无权否决触发；请根据审议上下文完成整理。
 原始争议信号：\n{json.dumps(raw_disputes, ensure_ascii=False)}
 策略：{strategy}。合并语义相同项，不得删除任何原始信号；若 always 模式没有信号，可从修订意见提出带来源的具体候选争议。
 只输出一个 ```json 代码块：{{"disputes":[{{"id":"D1","title":"中性标题","description":"争议为何影响结论","sources":["agent-id"]}}]}}。"""

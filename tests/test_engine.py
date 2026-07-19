@@ -6,7 +6,7 @@ import pytest
 
 from mad.adapters import AdapterError, AdapterResult
 from mad.archive import Archive
-from mad.engine import DeliberationCancelled, DeliberationEngine
+from mad.engine import DeliberationCancelled, DeliberationEngine, DeliberationError
 from mad.models import AgentProfile, CheckpointDecision, DeliberationRequest, Stage
 
 
@@ -76,6 +76,29 @@ class BlockingCritiqueAdapter(FakeAdapter):
         return await super().invoke(prompt, cwd)
 
 
+class SummaryAdapter(FakeAdapter):
+    fail_summary = False
+
+    async def invoke(self, prompt, cwd):
+        self.calls.append((self.profile.id, prompt))
+        if "供所有后续参与者共同使用的统一审议摘要" in prompt:
+            if self.fail_summary:
+                raise AdapterError("摘要服务暂时不可用")
+            text = "统一摘要：原问题为问题；无用户指导；A/B 提出长论点；关键假设待验证；来源 source://one。"
+        elif "独立分析问题" in prompt:
+            text = f"{self.profile.id} 的长论点与假设 source://one。" + "长论点" * 300
+        elif "has_critical_dispute" in prompt:
+            text = f'''{self.profile.id} 的修订观点
+```json
+{{"has_critical_dispute": false, "disputes": []}}
+```'''
+        elif "最终报告" in prompt and self.profile.id == "a":
+            text = "# 最终报告\n\n完成。"
+        else:
+            text = f"{self.profile.id} 的简短观点"
+        return AdapterResult(text, 0.01, text)
+
+
 @pytest.mark.asyncio
 async def test_full_deliberation_writes_report(tmp_path: Path):
     FakeAdapter.calls.clear()
@@ -99,6 +122,7 @@ async def test_full_deliberation_writes_report(tmp_path: Path):
     revisions = [row for row in rows if row["stage"] == "修订意见"]
     assert all("```json" not in row["text"] for row in revisions)
     assert all(row["metadata"]["dispute_signal"]["has_critical_dispute"] for row in revisions)
+    assert not any("统一审议摘要" in prompt for _, prompt in FakeAdapter.calls)
 
 
 @pytest.mark.asyncio
@@ -284,3 +308,75 @@ def test_resume_rejects_corrupt_or_incompatible_state(tmp_path: Path):
     (archive.path / "state.json").write_text('{"schema_version": 999}')
     with pytest.raises(ValueError, match="不支持"):
         archive.load_state()
+
+
+@pytest.mark.asyncio
+async def test_lowest_participant_budget_triggers_one_shared_audited_summary(tmp_path: Path):
+    for name in ("deliberations", "temp"):
+        (tmp_path / name).mkdir()
+    profiles = [
+        AgentProfile("a", "A", "fake", context_budget=100_000),
+        AgentProfile("b", "B", "fake", context_budget=700),
+    ]
+    SummaryAdapter.calls.clear()
+    SummaryAdapter.fail_summary = False
+    engine = DeliberationEngine(profiles, tmp_path, adapter_factory=SummaryAdapter)
+    result = await engine.run(DeliberationRequest("问题", ["a", "b"], "a", convergence="never"))
+
+    summary_calls = [
+        prompt for _, prompt in SummaryAdapter.calls if "供所有后续参与者共同使用的统一审议摘要" in prompt
+    ]
+    assert len(summary_calls) == 1
+    critique_prompts = [prompt for _, prompt in SummaryAdapter.calls if "阅读已有陈述" in prompt]
+    assert len(critique_prompts) == 2
+    assert all("统一摘要：原问题为问题" in prompt for prompt in critique_prompts)
+    assert all("长论点长论点长论点" not in prompt for prompt in critique_prompts)
+    assert len(set(critique_prompts)) == 1
+    summary_call_index = next(
+        index
+        for index, (_, prompt) in enumerate(SummaryAdapter.calls)
+        if "供所有后续参与者共同使用的统一审议摘要" in prompt
+    )
+    assert all(
+        "统一摘要：原问题为问题" in prompt
+        for _, prompt in SummaryAdapter.calls[summary_call_index + 1 :]
+    )
+
+    transcript = (result.archive_path / "transcript.jsonl").read_text()
+    assert "长论点长论点长论点" in transcript
+    state = json.loads((result.archive_path / "state.json").read_text())
+    assert state["summary"]["through_count"] == 2
+    assert state["summary"]["trigger_stage"] == Stage.CRITIQUE.value
+    assert state["summary"]["estimated_tokens_before"]["b"] > 700
+    assert state["summary"]["estimated_tokens_after"]["b"] <= 700
+    events = [json.loads(line) for line in (result.archive_path / "events.jsonl").read_text().splitlines()]
+    summary_event = next(event for event in events if event["type"] == "context_summary")
+    assert summary_event["text"] == state["summary"]["text"]
+
+
+@pytest.mark.asyncio
+async def test_summary_failure_pauses_and_can_retry_on_resume(tmp_path: Path):
+    for name in ("deliberations", "temp"):
+        (tmp_path / name).mkdir()
+    profiles = [
+        AgentProfile("a", "A", "fake", context_budget=100_000),
+        AgentProfile("b", "B", "fake", context_budget=700),
+    ]
+    SummaryAdapter.calls.clear()
+    SummaryAdapter.fail_summary = True
+    engine = DeliberationEngine(profiles, tmp_path, adapter_factory=SummaryAdapter)
+    with pytest.raises(DeliberationError, match="摘要生成失败.*已暂停"):
+        await engine.run(DeliberationRequest("问题", ["a", "b"], "a", convergence="never"))
+
+    archive_path = next((tmp_path / "deliberations").iterdir())
+    state = json.loads((archive_path / "state.json").read_text())
+    assert state["status"] == "可恢复"
+    assert state["active_stage"] == Stage.CRITIQUE.value
+    assert [json.loads(line)["stage"] for line in (archive_path / "transcript.jsonl").read_text().splitlines()] == [
+        Stage.OPENING.value,
+        Stage.OPENING.value,
+    ]
+
+    SummaryAdapter.fail_summary = False
+    result = await engine.resume(archive_path.name)
+    assert result.status == "完成"

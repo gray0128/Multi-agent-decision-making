@@ -7,6 +7,7 @@ from typing import Any
 
 
 class Stage(StrEnum):
+    SUMMARY = "审议摘要"
     OPENING = "独立陈述"
     CRITIQUE = "质疑与补充"
     REVISION = "修订意见"

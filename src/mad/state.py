@@ -34,6 +34,7 @@ class DeliberationState:
     guidance: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     convergence: dict[str, Any] = field(default_factory=dict)
+    summary: dict[str, Any] = field(default_factory=dict)
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
 
