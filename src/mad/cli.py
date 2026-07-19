@@ -10,6 +10,7 @@ from pathlib import Path
 from .config import agents_path, app_home, initialize, load_agents
 from .engine import DeliberationCancelled, DeliberationEngine, DeliberationError
 from .models import CheckpointDecision, DeliberationRequest, Stage
+from .planning import DeliberationPlan, OrganizerService, PlanError, manual_plan, parse_plan_payload
 
 
 def parser() -> argparse.ArgumentParser:
@@ -25,6 +26,9 @@ def parser() -> argparse.ArgumentParser:
     deliberate.add_argument("--direct-workspace", action="store_true")
     deliberate.add_argument("--agents", help="逗号分隔的 Agent ID")
     deliberate.add_argument("--report-agent")
+    deliberate.add_argument("--organizer", help="按次启用的组局 Agent ID；默认关闭")
+    deliberate.add_argument("--role", action="append", default=[], metavar="AGENT_ID=ROLE")
+    deliberate.add_argument("--confirm-plan", action="store_true", help="确认最终审议方案并跳过终端询问")
     deliberate.add_argument("--interactive", action="store_true")
     deliberate.add_argument("--convergence", choices=("auto", "always", "never"), default="auto")
     deliberate.add_argument("--format", choices=("markdown", "json"), default="markdown")
@@ -71,22 +75,45 @@ async def deliberate(args: argparse.Namespace) -> int:
     if not profiles:
         print(f"没有可用 Agent 配置，请编辑 {agents_path()}", file=sys.stderr)
         return 3
-    ids = args.agents.split(",") if args.agents else [item.id for item in profiles]
-    report = args.report_agent or next((item.id for item in profiles if item.default_report), ids[0])
     if args.direct_workspace and not args.workspace:
         print("--direct-workspace 必须与 --workspace 一起使用", file=sys.stderr)
+        return 2
+    try:
+        role_overrides = _parse_role_overrides(args.role)
+        planning_cwd = args.workspace.expanduser().resolve() if args.workspace else home
+        if not planning_cwd.is_dir():
+            raise PlanError(f"工作目录不存在：{planning_cwd}")
+        planner = OrganizerService(profiles)
+        healthy = await planner.preflight(planning_cwd, project_mode=args.workspace is not None)
+        healthy_ids = {item.id for item in healthy}
+        if len(healthy) < 2:
+            raise PlanError("预检后可用参与者不足两个")
+        if args.organizer:
+            suggested = await planner.propose(args.question, args.organizer, healthy, planning_cwd)
+            plan = _override_plan(suggested, profiles, healthy_ids, args, role_overrides)
+        else:
+            ids = args.agents.split(",") if args.agents else [item.id for item in healthy]
+            report = args.report_agent or next((item.id for item in healthy if item.default_report), ids[0])
+            plan = manual_plan(profiles, ids, report, role_overrides, allowed_ids=healthy_ids)
+        plan = _confirm_plan(plan, healthy_ids, confirmed=args.confirm_plan)
+    except KeyboardInterrupt:
+        return 130
+    except (PlanError, EOFError) as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     engine = DeliberationEngine(profiles, home, concurrency=max(1, min(args.concurrency, 6)))
     try:
         result = await engine.run(
             DeliberationRequest(
                 args.question,
-                ids,
-                report,
+                plan.agent_ids,
+                plan.report_agent_id,
                 args.workspace,
                 args.direct_workspace,
                 interactive=args.interactive,
                 convergence=args.convergence,
+                roles=plan.roles,
+                organizer_agent_id=plan.organizer_agent_id,
             ),
             checkpoint=_checkpoint if args.interactive else None,
             progress=lambda message: print(message, file=sys.stderr, flush=True),
@@ -102,6 +129,50 @@ async def deliberate(args: argparse.Namespace) -> int:
         print(result.report)
         print(f"\n审议档案：{result.archive_path}", file=sys.stderr)
     return 0
+
+
+def _parse_role_overrides(values: list[str]) -> dict[str, str]:
+    result = {}
+    for value in values:
+        agent_id, separator, role = value.partition("=")
+        if not separator or not agent_id.strip() or not role.strip():
+            raise PlanError(f"临时角色格式应为 AGENT_ID=ROLE：{value}")
+        result[agent_id.strip()] = role.strip()
+    return result
+
+
+def _override_plan(suggested, profiles, healthy_ids, args, role_overrides):
+    ids = args.agents.split(",") if args.agents else suggested.agent_ids
+    suggested_roles = suggested.roles
+    roles = {agent_id: suggested_roles.get(agent_id, "") for agent_id in ids}
+    roles.update(role_overrides)
+    report = args.report_agent or suggested.report_agent_id
+    return manual_plan(
+        profiles,
+        ids,
+        report,
+        roles,
+        allowed_ids=healthy_ids,
+        organizer_agent_id=args.organizer,
+    )
+
+
+def _confirm_plan(plan: DeliberationPlan, allowed_ids: set[str], *, confirmed: bool) -> DeliberationPlan:
+    print("最终审议方案：", file=sys.stderr)
+    print(json.dumps(plan.to_dict(), ensure_ascii=False, indent=2), file=sys.stderr)
+    if confirmed:
+        return plan
+    answer = input("直接回车确认；输入 JSON 修改参与者、角色和报告 Agent；输入 /cancel 取消：").strip()
+    if answer == "/cancel":
+        raise PlanError("已取消")
+    if not answer:
+        return plan
+    return parse_plan_payload(
+        answer,
+        allowed_ids=allowed_ids,
+        organizer_agent_id=plan.organizer_agent_id,
+        source=plan.source,
+    )
 
 
 async def resume(args: argparse.Namespace) -> int:

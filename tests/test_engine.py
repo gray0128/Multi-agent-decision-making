@@ -113,6 +113,43 @@ async def test_never_strategy_skips_convergence(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_confirmed_plan_roles_are_used_and_archived(tmp_path: Path):
+    for name in ("deliberations", "temp"):
+        (tmp_path / name).mkdir()
+    profiles = [AgentProfile("a", "A", "fake"), AgentProfile("b", "B", "fake")]
+    FakeAdapter.calls.clear()
+    engine = DeliberationEngine(profiles, tmp_path, adapter_factory=FakeAdapter)
+    result = await engine.run(
+        DeliberationRequest(
+            "问题",
+            ["a", "b"],
+            "a",
+            convergence="never",
+            roles={"a": "决策主张者", "b": "风险质疑者"},
+            organizer_agent_id="b",
+        )
+    )
+    assert result.plan == {
+        "participants": [
+            {"id": "a", "role": "决策主张者"},
+            {"id": "b", "role": "风险质疑者"},
+        ],
+        "report_agent_id": "a",
+        "organizer_agent_id": "b",
+        "source": "organizer",
+    }
+    opening = [(agent_id, prompt) for agent_id, prompt in FakeAdapter.calls if "独立分析问题" in prompt]
+    assert "决策主张者" in next(prompt for agent_id, prompt in opening if agent_id == "a")
+    assert "风险质疑者" in next(prompt for agent_id, prompt in opening if agent_id == "b")
+    archived = json.loads((result.archive_path / "result.json").read_text())
+    plan = json.loads((result.archive_path / "plan.json").read_text())
+    state = json.loads((result.archive_path / "state.json").read_text())
+    assert archived["plan"] == result.plan
+    assert plan == result.plan
+    assert state["request"]["roles"] == {"a": "决策主张者", "b": "风险质疑者"}
+
+
+@pytest.mark.asyncio
 async def test_auto_requires_two_marked_participants(tmp_path: Path):
     for name in ("deliberations", "temp"):
         (tmp_path / name).mkdir()

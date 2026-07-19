@@ -43,6 +43,8 @@ class DeliberationRequest:
     language: str | None = None
     interactive: bool = False
     convergence: str = "auto"
+    roles: dict[str, str] = field(default_factory=dict)
+    organizer_agent_id: str | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,6 +78,7 @@ class RunResult:
     warnings: list[str]
     participants: list[str]
     convergence: dict[str, Any] = field(default_factory=dict)
+    plan: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
