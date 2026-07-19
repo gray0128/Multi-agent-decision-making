@@ -26,6 +26,7 @@ def parser() -> argparse.ArgumentParser:
     deliberate.add_argument("--agents", help="逗号分隔的 Agent ID")
     deliberate.add_argument("--report-agent")
     deliberate.add_argument("--interactive", action="store_true")
+    deliberate.add_argument("--convergence", choices=("auto", "always", "never"), default="auto")
     deliberate.add_argument("--format", choices=("markdown", "json"), default="markdown")
     deliberate.add_argument("--concurrency", type=int, default=6)
 
@@ -39,6 +40,18 @@ def parser() -> argparse.ArgumentParser:
 
 async def _checkpoint(stage: Stage, _items) -> str | None:
     print(f"\n阶段检查点：{stage.value}", file=sys.stderr)
+    if stage == Stage.DISPUTE_DECISION:
+        for item in _items:
+            signal = item.metadata.get("dispute_signal")
+            if not signal:
+                print(f"- {item.agent_name}：争议信号无效", file=sys.stderr)
+                continue
+            titles = "；".join(value["title"] for value in signal.get("disputes", [])) or "无"
+            print(f"- {item.agent_name}：{titles}", file=sys.stderr)
+        answer = input("回车采用自动判断；输入 /trigger [争议] 强制触发；输入 /skip 跳过；输入 /cancel 取消：").strip()
+        if answer == "/cancel":
+            raise KeyboardInterrupt
+        return answer or None
     answer = input("直接回车继续；输入指导意见后继续；输入 /cancel 取消：").strip()
     if answer == "/cancel":
         raise KeyboardInterrupt
@@ -60,7 +73,15 @@ async def deliberate(args: argparse.Namespace) -> int:
     engine = DeliberationEngine(profiles, home, concurrency=max(1, min(args.concurrency, 6)))
     try:
         result = await engine.run(
-            DeliberationRequest(args.question, ids, report, args.workspace, args.direct_workspace, interactive=args.interactive),
+            DeliberationRequest(
+                args.question,
+                ids,
+                report,
+                args.workspace,
+                args.direct_workspace,
+                interactive=args.interactive,
+                convergence=args.convergence,
+            ),
             checkpoint=_checkpoint if args.interactive else None,
             progress=lambda message: print(message, file=sys.stderr, flush=True),
         )

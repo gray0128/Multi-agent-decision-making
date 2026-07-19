@@ -10,6 +10,9 @@ class Stage(StrEnum):
     OPENING = "独立陈述"
     CRITIQUE = "质疑与补充"
     REVISION = "修订意见"
+    DISPUTE_ORGANIZATION = "争议整理"
+    DISPUTE_DECISION = "争议判定"
+    CONVERGENCE = "争议收敛"
     DRAFT = "报告草稿"
     REVIEW = "报告审阅"
     FINAL = "最终修订"
@@ -39,6 +42,7 @@ class DeliberationRequest:
     direct_workspace: bool = False
     language: str | None = None
     interactive: bool = False
+    convergence: str = "auto"
 
 
 @dataclass(slots=True)
@@ -49,6 +53,7 @@ class Contribution:
     text: str
     duration_seconds: float
     attempts: int
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -64,6 +69,7 @@ class RunResult:
     archive_path: Path
     warnings: list[str]
     participants: list[str]
+    convergence: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

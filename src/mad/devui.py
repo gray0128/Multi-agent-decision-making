@@ -17,6 +17,7 @@ class DevUiRequest:
     report_agent: str = ""
     workspace: str = ""
     direct_workspace: bool = False
+    convergence: str = "auto"
 
 
 class DeliberationExecutor(Executor):
@@ -37,6 +38,7 @@ class DeliberationExecutor(Executor):
                 report_agent_id=report,
                 workspace=Path(request.workspace) if request.workspace else None,
                 direct_workspace=request.direct_workspace,
+                convergence=request.convergence,
             )
         )
         await ctx.yield_output(result.report)
