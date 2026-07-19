@@ -355,6 +355,7 @@ class CliAdapter:
     @staticmethod
     def _public_text(raw: str) -> str:
         documents: list[dict[str, Any]] = []
+        structured = False
         stripped = raw.strip()
         if not stripped:
             return ""
@@ -370,9 +371,13 @@ class CliAdapter:
                     documents.append(value)
         else:
             if isinstance(value, dict):
+                structured = True
                 documents.append(value)
+            elif isinstance(value, list):
+                structured = True
+                documents.extend(item for item in value if isinstance(item, dict))
         if not documents:
-            return CliAdapter._clean_public_text(raw)
+            return "" if structured else CliAdapter._clean_public_text(raw)
 
         final: list[str] = []
         messages: list[str] = []
@@ -394,11 +399,12 @@ class CliAdapter:
             elif isinstance(message, dict) and item_type not in {"message_start", "message_update"}:
                 CliAdapter._append_content(messages, message.get("content"))
             if item.get("type") in {"assistant", "agent_message", "message"}:
-                CliAdapter._append_content(messages, item.get("text") or item.get("content"))
+                if item_type != "message" or item.get("role") in {None, "assistant"}:
+                    CliAdapter._append_content(messages, item.get("text") or item.get("content"))
             elif isinstance(item.get("text"), str):
                 messages.append(item["text"])
         selected = final or messages
-        value = "\n".join(dict.fromkeys(value.strip() for value in selected if value.strip())) or raw
+        value = "\n".join(dict.fromkeys(value.strip() for value in selected if value.strip()))
         return CliAdapter._clean_public_text(value)
 
     @staticmethod

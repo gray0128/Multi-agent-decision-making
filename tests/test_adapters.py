@@ -153,7 +153,20 @@ def test_two_pi_models_share_adapter_but_keep_distinct_commands(tmp_path: Path):
             "pi",
             b'{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"READY"}]}}\n',
         ),
-        ("codebuddy", b'{"type":"result","result":"READY"}'),
+        (
+            "codebuddy",
+            json.dumps(
+                [
+                    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "PRIVATE"}]},
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "READY"}],
+                    },
+                    {"type": "result", "subtype": "success", "result": "READY"},
+                ]
+            ).encode(),
+        ),
     ],
 )
 async def test_pi_and_codebuddy_complete_normalized_plain_text_invocation(
@@ -170,6 +183,42 @@ async def test_pi_and_codebuddy_complete_normalized_plain_text_invocation(
     result = await CliAdapter(profile(adapter)).invoke("PROMPT", tmp_path)
     assert result.text == "READY"
     assert launched and launched[0][-1] == "PROMPT"
+
+
+@pytest.mark.asyncio
+async def test_codebuddy_array_without_result_exposes_only_assistant_text(monkeypatch, tmp_path: Path):
+    stdout = json.dumps(
+        [
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "PRIVATE"}]},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "PUBLIC"}],
+            },
+        ]
+    ).encode()
+
+    async def create(*_command, **_kwargs):
+        return FakeProcess(stdout=stdout)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    result = await CliAdapter(profile("codebuddy")).invoke("PROMPT", tmp_path)
+    assert result.text == "PUBLIC"
+
+
+@pytest.mark.asyncio
+async def test_codebuddy_array_without_assistant_text_fails_closed(monkeypatch, tmp_path: Path):
+    stdout = json.dumps(
+        [{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "PRIVATE"}]}]
+    ).encode()
+
+    async def create(*_command, **_kwargs):
+        return FakeProcess(stdout=stdout)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create)
+    with pytest.raises(AdapterError, match="CLI 未返回公开文本") as caught:
+        await CliAdapter(profile("codebuddy")).invoke("PROMPT", tmp_path)
+    assert "PRIVATE" not in str(caught.value)
 
 
 def test_plain_output_strips_reasonix_terminal_metadata():

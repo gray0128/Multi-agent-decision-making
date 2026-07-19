@@ -10,7 +10,10 @@ SENSITIVE_SUFFIXES = {".pem", ".key", ".p12", ".pfx"}
 
 
 def _safe(relative: Path) -> bool:
-    return not any(part in SENSITIVE_NAMES for part in relative.parts) and relative.suffix.lower() not in SENSITIVE_SUFFIXES
+    return (
+        not any(part in SENSITIVE_NAMES or part.startswith(".env") for part in relative.parts)
+        and relative.suffix.lower() not in SENSITIVE_SUFFIXES
+    )
 
 
 def create_snapshot(workspace: Path, target: Path) -> Path:
@@ -30,12 +33,16 @@ def create_snapshot(workspace: Path, target: Path) -> Path:
         ).stdout.split(b"\0")
         paths = [Path(item.decode()) for item in listed if item]
     else:
-        paths = [item.relative_to(workspace) for item in workspace.rglob("*") if item.is_file() and not item.name.startswith(".")]
+        paths = []
+        for item in workspace.rglob("*"):
+            relative = item.relative_to(workspace)
+            if item.is_file() and not any(part.startswith(".") for part in relative.parts):
+                paths.append(relative)
     for relative in paths:
         if not _safe(relative):
             continue
         source = workspace / relative
-        if source.is_file():
+        if source.is_file() and not source.is_symlink():
             destination = target / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
