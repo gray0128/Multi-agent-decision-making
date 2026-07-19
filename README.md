@@ -64,4 +64,22 @@ uv run python scripts/smoke_adapters.py \
   --confirm-live
 ```
 
-传入 `--workspace <目录>` 时会验证项目只读模式；Codex、Claude Code 与 Grok 声明支持该模式，无法证明最低只读约束的适配器会在预检阶段被拒绝。预检会分别记录可执行文件、模型就绪状态和项目只读能力，并缓存 10 分钟。
+传入 `--workspace <目录>` 时会验证项目只读模式；Codex、Claude Code、Grok、Pi 与 CodeBuddy 声明支持该模式，无法证明最低只读约束的适配器会在预检阶段被拒绝。Pi 禁用扩展、技能、模板和项目自动信任，只开放 `read,grep,find,ls`；CodeBuddy 使用 plan 权限并只开放 `Read,Glob,Grep`。预检会分别记录 Agent 身份、适配器、模型、可执行文件、模型就绪状态和项目只读能力，并缓存 10 分钟。
+
+同一 Pi 可执行文件可注册多个独立模型身份，例如：
+
+```toml
+[[agents]]
+id = "pi-deepseek"
+name = "Pi · DeepSeek V4 Pro"
+adapter = "pi"
+model = "deepseek/deepseek-v4-pro"
+
+[[agents]]
+id = "pi-minimax"
+name = "Pi · MiniMax-M3"
+adapter = "pi"
+model = "minimax/minimax-m3"
+```
+
+模型字符串使用 Pi 支持的 `provider/model` 形式。每条正式发言和最终方案都会分别保存 Agent ID、显示名称、适配器和模型。

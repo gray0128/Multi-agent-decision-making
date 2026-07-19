@@ -283,7 +283,17 @@ class DeliberationEngine:
         healthy_ids = set()
         failures = {}
         for profile, result in zip(selected, results, strict=True):
-            archive.diagnostic({"kind": "preflight", "stage": PREFLIGHT_STAGE, "agent_id": profile.id, **result.to_dict()})
+            archive.diagnostic(
+                {
+                    "kind": "preflight",
+                    "stage": PREFLIGHT_STAGE,
+                    "agent_id": profile.id,
+                    "agent_name": profile.name,
+                    "adapter": profile.adapter,
+                    "model": profile.model,
+                    **result.to_dict(),
+                }
+            )
             if result.ready:
                 healthy_ids.add(profile.id)
             else:
@@ -307,11 +317,16 @@ class DeliberationEngine:
         archive.event({"type": "stage_committed", "stage": PREFLIGHT_STAGE, "participants": state.participants})
         return selected, report_agent
 
-    @staticmethod
-    def _plan_payload(state, request):
+    def _plan_payload(self, state, request):
         return {
             "participants": [
-                {"id": agent_id, "role": request.roles.get(agent_id, "")}
+                {
+                    "id": agent_id,
+                    "name": self.profiles[agent_id].name,
+                    "adapter": self.profiles[agent_id].adapter,
+                    "model": self.profiles[agent_id].model,
+                    "role": request.roles.get(agent_id, ""),
+                }
                 for agent_id in state.participants
             ],
             "report_agent_id": state.report_agent_id,
@@ -786,7 +801,7 @@ class DeliberationEngine:
                 try:
                     result = await self.adapter_factory(profile).invoke(prompt, cwd)
                     text = result.text
-                    metadata = {}
+                    metadata = {"adapter": profile.adapter, "model": profile.model}
                     if parse_revision_signal:
                         parsed = parse_revision(text)
                         text = parsed.public_text

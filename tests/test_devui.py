@@ -291,8 +291,8 @@ async def test_devui_user_can_modify_organizer_plan_before_start(tmp_path: Path)
     archived = json.loads((archive / "result.json").read_text())
     assert archived["plan"]["report_agent_id"] == "b"
     assert archived["plan"]["participants"] == [
-        {"id": "a", "role": "反方"},
-        {"id": "b", "role": "报告人"},
+        {"id": "a", "name": "A", "adapter": "fake", "model": None, "role": "反方"},
+        {"id": "b", "name": "B", "adapter": "fake", "model": None, "role": "报告人"},
     ]
 
 

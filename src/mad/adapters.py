@@ -126,7 +126,7 @@ class CliAdapter:
 
     @property
     def supports_project_read_only(self) -> bool:
-        return self.profile.adapter.lower() in {"codex", "claude", "claudecode", "grok"}
+        return self.profile.adapter.lower() in {"codex", "claude", "claudecode", "grok", "pi", "codebuddy"}
 
     def command(self, cwd: Path, prompt: str) -> tuple[list[str], bytes | None]:
         model = ["--model", self.profile.model] if self.profile.model else []
@@ -203,8 +203,49 @@ class CliAdapter:
                     ],
                     None,
                 )
-            case "pi" | "codebuddy":
-                return [self.executable, *model, *extra, prompt], None
+            case "pi":
+                return (
+                    [
+                        self.executable,
+                        "--mode",
+                        "json",
+                        "--no-session",
+                        "--no-approve",
+                        "--no-extensions",
+                        "--no-skills",
+                        "--no-prompt-templates",
+                        "--no-themes",
+                        "--no-context-files",
+                        "--tools",
+                        "read,grep,find,ls",
+                        *model,
+                        *extra,
+                        prompt,
+                    ],
+                    None,
+                )
+            case "codebuddy":
+                return (
+                    [
+                        self.executable,
+                        "-p",
+                        "--output-format",
+                        "json",
+                        "--permission-mode",
+                        "plan",
+                        "--tools",
+                        "Read,Glob,Grep",
+                        "--strict-mcp-config",
+                        "--mcp-config",
+                        '{"mcpServers":{}}',
+                        "--setting-sources",
+                        "user",
+                        *model,
+                        *extra,
+                        prompt,
+                    ],
+                    None,
+                )
             case _:
                 raise AdapterError(f"不支持的 CLI 适配器：{self.profile.adapter}")
 
@@ -336,6 +377,7 @@ class CliAdapter:
         final: list[str] = []
         messages: list[str] = []
         for item in documents:
+            item_type = item.get("type")
             result = item.get("result")
             if isinstance(result, str) and result.strip():
                 final.append(result)
@@ -343,7 +385,13 @@ class CliAdapter:
             if isinstance(nested_item, dict) and nested_item.get("type") in {"agent_message", "message"}:
                 CliAdapter._append_content(messages, nested_item.get("text") or nested_item.get("content"))
             message = item.get("message")
-            if isinstance(message, dict):
+            if (
+                isinstance(message, dict)
+                and item_type in {"message_end", "turn_end"}
+                and message.get("role") == "assistant"
+            ):
+                CliAdapter._append_content(final, message.get("content"))
+            elif isinstance(message, dict) and item_type not in {"message_start", "message_update"}:
                 CliAdapter._append_content(messages, message.get("content"))
             if item.get("type") in {"assistant", "agent_message", "message"}:
                 CliAdapter._append_content(messages, item.get("text") or item.get("content"))
