@@ -13,8 +13,8 @@ from mad.devui import (
     DevUiRequest,
     build_workflow,
 )
-from mad.engine import DeliberationEngine
-from mad.models import AgentProfile
+from mad.engine import DeliberationCancelled, DeliberationEngine
+from mad.models import AgentProfile, CheckpointDecision, DeliberationRequest
 
 
 class FakeAdapter:
@@ -116,7 +116,7 @@ async def test_guided_devui_pauses_at_four_checkpoints_and_resumes(tmp_path: Pat
         json.loads(line)
         for line in (tmp_path / "deliberations" / deliberation_id / "events.jsonl").read_text().splitlines()
     ]
-    assert {event["type"] for event in events} == {"user_guidance", "dispute_override"}
+    assert {event["type"] for event in events} == {"stage_committed", "user_guidance", "dispute_override"}
     assert next(event for event in events if event["type"] == "user_guidance")["text"] == "下一阶段指导"
     assert next(event for event in events if event["type"] == "dispute_override")["action"] == "skip"
     metadata = json.loads(
@@ -198,7 +198,7 @@ async def test_cancel_cleans_live_session(tmp_path: Path):
     metadata = json.loads(
         (tmp_path / "deliberations" / request.data.deliberation_id / "metadata.json").read_text()
     )
-    assert metadata["status"] == "已取消"
+    assert metadata["status"] == "可恢复"
     assert metadata["status_reason"] == "用户取消审议"
 
 
@@ -214,3 +214,26 @@ async def test_expired_session_returns_diagnostic_output(tmp_path: Path):
     result = await workflow.run(responses={request.request_id: response_for(request)})
     assert "已过期" in result.get_outputs()[0]
     assert any(event.type == "warning" and "已过期" in event.data for event in result)
+
+
+@pytest.mark.asyncio
+async def test_devui_can_reopen_persisted_checkpoint_after_process_loss(tmp_path: Path):
+    workflow = make_workflow(tmp_path)
+    executor = next(value for value in workflow.get_executors_list() if isinstance(value, DeliberationExecutor))
+
+    async def cancel(_stage, _items):
+        return CheckpointDecision(action="cancel")
+
+    with pytest.raises(DeliberationCancelled):
+        await executor.engine.run(
+            DeliberationRequest("问题", ["a", "b"], "a", interactive=True, convergence="never"),
+            checkpoint=cancel,
+        )
+    deliberation_id = next((tmp_path / "deliberations").iterdir()).name
+
+    result = await workflow.run(DevUiRequest("", resume_id=deliberation_id))
+    request = only_request(result)
+    assert request.data.deliberation_id == deliberation_id
+    assert request.data.stage == "独立陈述"
+    result = await workflow.run(responses={request.request_id: response_for(request, action="cancel")})
+    assert "已取消" in result.get_outputs()[0]

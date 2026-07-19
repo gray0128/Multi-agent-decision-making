@@ -8,8 +8,8 @@ import sys
 from pathlib import Path
 
 from .config import agents_path, app_home, initialize, load_agents
-from .engine import DeliberationEngine, DeliberationError
-from .models import DeliberationRequest, Stage
+from .engine import DeliberationCancelled, DeliberationEngine, DeliberationError
+from .models import CheckpointDecision, DeliberationRequest, Stage
 
 
 def parser() -> argparse.ArgumentParser:
@@ -30,6 +30,12 @@ def parser() -> argparse.ArgumentParser:
     deliberate.add_argument("--format", choices=("markdown", "json"), default="markdown")
     deliberate.add_argument("--concurrency", type=int, default=6)
 
+    resume_command = commands.add_parser("resume", help="恢复一次未完成的审议")
+    resume_command.add_argument("deliberation_id")
+    resume_command.add_argument("--interactive", action="store_true")
+    resume_command.add_argument("--format", choices=("markdown", "json"), default="markdown")
+    resume_command.add_argument("--concurrency", type=int, default=6)
+
     serve = commands.add_parser("serve", help="启动 DevUI")
     serve.add_argument("--port", type=int, default=8080)
     serve.add_argument("--no-open", action="store_true")
@@ -38,7 +44,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-async def _checkpoint(stage: Stage, _items) -> str | None:
+async def _checkpoint(stage: Stage, _items) -> CheckpointDecision | str | None:
     print(f"\n阶段检查点：{stage.value}", file=sys.stderr)
     if stage == Stage.DISPUTE_DECISION:
         for item in _items:
@@ -50,11 +56,11 @@ async def _checkpoint(stage: Stage, _items) -> str | None:
             print(f"- {item.agent_name}：{titles}", file=sys.stderr)
         answer = input("回车采用自动判断；输入 /trigger [争议] 强制触发；输入 /skip 跳过；输入 /cancel 取消：").strip()
         if answer == "/cancel":
-            raise KeyboardInterrupt
+            return CheckpointDecision(action="cancel")
         return answer or None
     answer = input("直接回车继续；输入指导意见后继续；输入 /cancel 取消：").strip()
     if answer == "/cancel":
-        raise KeyboardInterrupt
+        return CheckpointDecision(action="cancel")
     return answer or None
 
 
@@ -85,7 +91,7 @@ async def deliberate(args: argparse.Namespace) -> int:
             checkpoint=_checkpoint if args.interactive else None,
             progress=lambda message: print(message, file=sys.stderr, flush=True),
         )
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, DeliberationCancelled):
         return 130
     except (DeliberationError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
@@ -96,6 +102,37 @@ async def deliberate(args: argparse.Namespace) -> int:
         print(result.report)
         print(f"\n审议档案：{result.archive_path}", file=sys.stderr)
     return 0
+
+
+async def resume(args: argparse.Namespace) -> int:
+    home = app_home()
+    initialize(home)
+    profiles = [item for item in load_agents() if item.enabled]
+    engine = DeliberationEngine(profiles, home, concurrency=max(1, min(args.concurrency, 6)))
+    try:
+        result = await engine.resume(
+            args.deliberation_id,
+            checkpoint=_checkpoint if args.interactive else None,
+            progress=lambda message: print(message, file=sys.stderr, flush=True),
+        )
+    except (KeyboardInterrupt, DeliberationCancelled):
+        return 130
+    except (DeliberationError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    if args.format == "json":
+        print(json.dumps(result.to_dict(), ensure_ascii=False))
+    else:
+        print(result.report)
+        print(f"\n审议档案：{result.archive_path}", file=sys.stderr)
+    return 0
+
+
+def _temp_candidates(temp: Path) -> list[Path]:
+    if not temp.exists():
+        return []
+    protected = {".mad-active", ".mad-recoverable"}
+    return [item for item in temp.iterdir() if not any((item / marker).exists() for marker in protected)]
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -110,6 +147,8 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(0)
     if args.command == "deliberate":
         raise SystemExit(asyncio.run(deliberate(args)))
+    if args.command == "resume":
+        raise SystemExit(asyncio.run(resume(args)))
     if args.command == "serve":
         initialize()
         from .devui import serve
@@ -118,7 +157,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(0)
     if args.command == "clean-temp":
         temp = app_home() / "temp"
-        candidates = [item for item in temp.iterdir() if not (item / ".mad-active").exists()] if temp.exists() else []
+        candidates = _temp_candidates(temp)
         if not candidates:
             print("没有可清理的孤立临时文件")
             raise SystemExit(0)
