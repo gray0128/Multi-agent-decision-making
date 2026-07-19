@@ -35,12 +35,12 @@ executable="/opt/homebrew/bin/pi"
 id="pi-minimax"
 name="Pi · MiniMax-M3"
 adapter="pi"
-model="minimax/minimax-m3"
+model="minimax/MiniMax-M3"
 executable="/opt/homebrew/bin/pi"
 '''
     )
     profiles = load_agents(path)
     assert [item.id for item in profiles] == ["pi-deepseek", "pi-minimax"]
     assert [item.name for item in profiles] == ["Pi · DeepSeek V4 Pro", "Pi · MiniMax-M3"]
-    assert [item.model for item in profiles] == ["deepseek/deepseek-v4-pro", "minimax/minimax-m3"]
+    assert [item.model for item in profiles] == ["deepseek/deepseek-v4-pro", "minimax/MiniMax-M3"]
     assert len({item.executable for item in profiles}) == 1

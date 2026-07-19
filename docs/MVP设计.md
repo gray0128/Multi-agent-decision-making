@@ -82,7 +82,7 @@ context_budget = 64000
 id = "pi-minimax"
 name = "MiniMax 审稿人"
 adapter = "pi"
-model = "minimax/minimax-m3"
+model = "minimax/MiniMax-M3"
 role = "侧重发现遗漏、矛盾和不可执行的建议"
 enabled = true
 default_report = true
@@ -292,7 +292,7 @@ mad deliberate \
   --agents pi-deepseek,pi-minimax,claude-opus \
   --report-agent claude-opus \
   --convergence auto \
-  --non-interactive \
+  --confirm-plan \
   --format json
 ```
 
