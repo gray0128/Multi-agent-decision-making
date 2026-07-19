@@ -12,6 +12,7 @@ from .archive import Archive
 from .config import app_home, load_agents
 from .engine import DeliberationCancelled, DeliberationEngine
 from .models import CheckpointDecision, Contribution, DeliberationRequest, RunResult, Stage
+from .planning import DeliberationPlan, OrganizerService, PlanError, manual_plan, parse_plan_payload
 
 
 @dataclass
@@ -24,6 +25,25 @@ class DevUiRequest:
     convergence: str = "auto"
     interactive: bool = True
     resume_id: str = ""
+    organizer: str = ""
+    roles: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class DevUiPlanRequest:
+    deliberation_id: str
+    interrupt_id: str
+    plan: dict[str, Any]
+    available_agents: list[dict[str, str]]
+
+
+@dataclass
+class DevUiPlanResponse:
+    deliberation_id: str
+    interrupt_id: str
+    action: str = "confirm"
+    participants: list[dict[str, str]] = field(default_factory=list)
+    report_agent_id: str = ""
 
 
 @dataclass
@@ -54,6 +74,13 @@ class _CancelledBoundary:
 @dataclass(slots=True)
 class _ErrorBoundary:
     error: Exception
+
+
+@dataclass(slots=True)
+class _PendingPlan:
+    request: DevUiRequest
+    plan_request: DevUiPlanRequest
+    allowed_ids: set[str]
 
 
 class _LiveSession:
@@ -211,6 +238,7 @@ class DeliberationExecutor(Executor):
         super().__init__("structured-deliberation")
         self.engine = engine
         self.sessions: dict[str, _LiveSession] = {}
+        self.pending_plans: dict[str, _PendingPlan] = {}
 
     @handler
     async def deliberate(self, request: DevUiRequest, ctx: WorkflowContext[None, str]) -> None:
@@ -235,22 +263,116 @@ class DeliberationExecutor(Executor):
                 raise
             return
         profiles = list(self.engine.profiles.values())
-        enabled = [item.id for item in profiles if item.enabled]
-        agents = request.agents or enabled
-        if not agents:
-            raise ValueError("没有可用的 Agent 配置")
-        report = request.report_agent or next((item.id for item in profiles if item.default_report), agents[0])
+        planning_cwd = Path(request.workspace).expanduser().resolve() if request.workspace else self.engine.home
+        planner = OrganizerService(profiles, adapter_factory=self.engine.adapter_factory)
+        healthy = await planner.preflight(planning_cwd, project_mode=bool(request.workspace))
+        if len(healthy) < 2:
+            raise ValueError("预检后可用参与者不足两个")
+        allowed_ids = {item.id for item in healthy}
+        try:
+            if request.organizer:
+                suggested = await planner.propose(request.question, request.organizer, healthy, planning_cwd)
+                agents = request.agents or suggested.agent_ids
+                roles = {agent_id: suggested.roles.get(agent_id, "") for agent_id in agents}
+                roles.update(request.roles)
+                report = request.report_agent or suggested.report_agent_id
+                plan = manual_plan(
+                    profiles,
+                    agents,
+                    report,
+                    roles,
+                    allowed_ids=allowed_ids,
+                    organizer_agent_id=request.organizer,
+                )
+            else:
+                agents = request.agents or [item.id for item in healthy]
+                report = request.report_agent or next(
+                    (item.id for item in healthy if item.default_report), agents[0]
+                )
+                plan = manual_plan(profiles, agents, report, request.roles, allowed_ids=allowed_ids)
+        except PlanError as exc:
+            raise ValueError(str(exc)) from exc
         deliberation_id = Archive.new_id()
+        interrupt_id = str(uuid4())
+        plan_request = DevUiPlanRequest(
+            deliberation_id,
+            interrupt_id,
+            plan.to_dict(),
+            [{"id": item.id, "name": item.name, "role": item.role} for item in healthy],
+        )
+        self.pending_plans[deliberation_id] = _PendingPlan(request, plan_request, allowed_ids)
+        await ctx.request_info(plan_request, DevUiPlanResponse, request_id=interrupt_id)
+
+    @response_handler(
+        request=DevUiPlanRequest,
+        response=DevUiPlanResponse,
+        workflow_output=str,
+    )
+    async def confirm_plan(self, original_request, response, ctx) -> None:
+        pending = self.pending_plans.get(original_request.deliberation_id)
+        error = self._validate_plan_response(pending, original_request, response, ctx.request_id)
+        if error:
+            await ctx.add_event(WorkflowEvent.warning(error))
+            if pending is None:
+                await ctx.yield_output(f"审议 {original_request.deliberation_id} 的方案确认已过期。")
+                return
+            replacement = replace(pending.plan_request, interrupt_id=str(uuid4()))
+            pending.plan_request = replacement
+            await ctx.request_info(replacement, DevUiPlanResponse, request_id=replacement.interrupt_id)
+            return
+        assert pending is not None
+        if response.action == "cancel":
+            self.pending_plans.pop(original_request.deliberation_id, None)
+            await ctx.yield_output(f"审议 {original_request.deliberation_id} 已在方案确认时取消。")
+            return
+        payload = {
+            "participants": response.participants or pending.plan_request.plan["participants"],
+            "report_agent_id": response.report_agent_id or pending.plan_request.plan["report_agent_id"],
+        }
+        try:
+            plan = parse_plan_payload(
+                payload,
+                allowed_ids=pending.allowed_ids,
+                organizer_agent_id=pending.request.organizer or None,
+                source="organizer" if pending.request.organizer else "manual",
+            )
+        except PlanError as exc:
+            await ctx.add_event(WorkflowEvent.warning(str(exc)))
+            replacement = replace(pending.plan_request, interrupt_id=str(uuid4()))
+            pending.plan_request = replacement
+            await ctx.request_info(replacement, DevUiPlanResponse, request_id=replacement.interrupt_id)
+            return
+        self.pending_plans.pop(original_request.deliberation_id, None)
+        await self._start_confirmed_plan(pending.request, plan, original_request.deliberation_id, ctx)
+
+    @staticmethod
+    def _validate_plan_response(pending, original, response, workflow_request_id):
+        if pending is None:
+            return "方案确认已过期"
+        current = pending.plan_request
+        if original.interrupt_id != current.interrupt_id or workflow_request_id != current.interrupt_id:
+            return "方案确认中断 ID 不匹配"
+        if response.deliberation_id != original.deliberation_id:
+            return "方案确认响应的审议 ID 不匹配"
+        if response.interrupt_id != current.interrupt_id:
+            return "方案确认响应的中断 ID 不匹配"
+        if response.action not in {"confirm", "cancel"}:
+            return f"方案确认不支持动作：{response.action}"
+        return None
+
+    async def _start_confirmed_plan(self, request, plan: DeliberationPlan, deliberation_id, ctx):
         session = _LiveSession(
             self.engine,
             DeliberationRequest(
                 question=request.question,
-                agent_ids=agents,
-                report_agent_id=report,
+                agent_ids=plan.agent_ids,
+                report_agent_id=plan.report_agent_id,
                 workspace=Path(request.workspace) if request.workspace else None,
                 direct_workspace=request.direct_workspace,
                 interactive=request.interactive,
                 convergence=request.convergence,
+                roles=plan.roles,
+                organizer_agent_id=plan.organizer_agent_id,
             ),
             deliberation_id,
             interactive=request.interactive,

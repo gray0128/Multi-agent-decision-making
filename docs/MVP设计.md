@@ -319,6 +319,7 @@ mad deliberate \
 ├── deliberations/
 │   └── <审议ID>/
 │       ├── metadata.json
+│       ├── plan.json
 │       ├── state.json
 │       ├── transcript.jsonl
 │       ├── events.jsonl

@@ -36,6 +36,21 @@ uv run mad resume <审议ID> --interactive
 
 自动模式的未完成审议可省略 `--interactive`。`mad clean-temp` 不会删除活动中或仍可恢复审议使用的快照。
 
+每次新审议都会在执行前展示最终审议方案并要求确认。自动化调用可在核对参数后传入 `--confirm-plan`；组局功能默认关闭，只有显式指定可信注册表中的 Agent 才会启用：
+
+```bash
+uv run mad deliberate "评估迁移路径" --organizer codex
+uv run mad deliberate "评估迁移路径" \
+  --organizer codex \
+  --agents codex,claude \
+  --report-agent claude \
+  --role codex=架构主张者 \
+  --role claude=风险审阅者 \
+  --confirm-plan
+```
+
+组局建议只能引用已启用且预检成功的 Agent 配置。CLI 参数或 DevUI 方案确认响应可修改建议中的参与者、临时角色和报告 Agent；最终确认方案写入审议档案的 `plan.json` 和 JSON 结果。
+
 ## 可选实机适配器冒烟
 
 实机冒烟会调用已认证模型并可能产生费用，因此必须显式确认，且至少指定两个 Agent：

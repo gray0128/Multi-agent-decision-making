@@ -70,6 +70,9 @@ class Archive:
     def save_state(self, state: DeliberationState) -> None:
         self._atomic_text("state.json", json.dumps(state.to_dict(), ensure_ascii=False, indent=2, default=str))
 
+    def save_plan(self, plan: dict) -> None:
+        self._json("plan.json", plan)
+
     def load_state(self) -> DeliberationState:
         target = self.path / "state.json"
         if not target.is_file():

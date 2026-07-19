@@ -10,6 +10,8 @@ from mad.devui import (
     DeliberationExecutor,
     DevUiCheckpointRequest,
     DevUiCheckpointResponse,
+    DevUiPlanRequest,
+    DevUiPlanResponse,
     DevUiRequest,
     build_workflow,
 )
@@ -25,7 +27,9 @@ class FakeAdapter:
 
     async def invoke(self, prompt, cwd):
         self.calls.append((self.profile.id, prompt))
-        if "只负责整理争议" in prompt:
+        if "一次性组局 Agent" in prompt:
+            text = '{"participants":[{"id":"a","role":"主张者"},{"id":"b","role":"质疑者"}],"report_agent_id":"a"}'
+        elif "只负责整理争议" in prompt:
             text = '```json\n{"disputes":[{"id":"D1","title":"方案分歧","description":"影响建议","sources":["a","b"]}]}\n```'
         elif "has_critical_dispute" in prompt:
             text = f'''{self.profile.id} 的修订观点
@@ -67,11 +71,27 @@ def response_for(request_event, *, action="continue", guidance=""):
     )
 
 
+async def start_confirmed(workflow, request, *, participants=None, report_agent_id=""):
+    result = await workflow.run(request)
+    event = only_request(result)
+    plan = event.data
+    assert isinstance(plan, DevUiPlanRequest)
+    response = DevUiPlanResponse(
+        deliberation_id=plan.deliberation_id,
+        interrupt_id=plan.interrupt_id,
+        participants=participants or [],
+        report_agent_id=report_agent_id,
+    )
+    return await workflow.run(responses={event.request_id: response}), event
+
+
 @pytest.mark.asyncio
 async def test_guided_devui_pauses_at_four_checkpoints_and_resumes(tmp_path: Path):
     FakeAdapter.calls.clear()
     workflow = make_workflow(tmp_path)
-    result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
+    result, _plan = await start_confirmed(
+        workflow, DevUiRequest("问题", agents=["a", "b"], report_agent="a")
+    )
     seen = []
 
     first = only_request(result)
@@ -128,9 +148,11 @@ async def test_guided_devui_pauses_at_four_checkpoints_and_resumes(tmp_path: Pat
 @pytest.mark.asyncio
 async def test_automatic_devui_run_has_no_normal_checkpoints(tmp_path: Path):
     workflow = make_workflow(tmp_path)
-    result = await workflow.run(
-        DevUiRequest("问题", agents=["a", "b"], report_agent="a", interactive=False, convergence="never")
+    result, plan = await start_confirmed(
+        workflow,
+        DevUiRequest("问题", agents=["a", "b"], report_agent="a", interactive=False, convergence="never"),
     )
+    assert isinstance(plan.data, DevUiPlanRequest)
     assert result.get_request_info_events() == []
     assert result.get_outputs() == ["# 最终报告\n\n完成。"]
 
@@ -138,7 +160,9 @@ async def test_automatic_devui_run_has_no_normal_checkpoints(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_wrong_response_ids_are_rejected_without_advancing(tmp_path: Path):
     workflow = make_workflow(tmp_path)
-    result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
+    result, _plan = await start_confirmed(
+        workflow, DevUiRequest("问题", agents=["a", "b"], report_agent="a")
+    )
     first = only_request(result)
     wrong = response_for(first)
     wrong.deliberation_id = "wrong-id"
@@ -172,7 +196,9 @@ async def test_wrong_response_ids_are_rejected_without_advancing(tmp_path: Path)
 @pytest.mark.asyncio
 async def test_duplicate_response_is_rejected_without_consuming_current_checkpoint(tmp_path: Path):
     workflow = make_workflow(tmp_path)
-    result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
+    result, _plan = await start_confirmed(
+        workflow, DevUiRequest("问题", agents=["a", "b"], report_agent="a")
+    )
     first = only_request(result)
     result = await workflow.run(responses={first.request_id: response_for(first)})
     second = only_request(result)
@@ -190,7 +216,9 @@ async def test_duplicate_response_is_rejected_without_consuming_current_checkpoi
 async def test_cancel_cleans_live_session(tmp_path: Path):
     workflow = make_workflow(tmp_path)
     executor = next(value for value in workflow.get_executors_list() if isinstance(value, DeliberationExecutor))
-    result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
+    result, _plan = await start_confirmed(
+        workflow, DevUiRequest("问题", agents=["a", "b"], report_agent="a")
+    )
     request = only_request(result)
     result = await workflow.run(responses={request.request_id: response_for(request, action="cancel")})
     assert "已取消" in result.get_outputs()[0]
@@ -206,7 +234,9 @@ async def test_cancel_cleans_live_session(tmp_path: Path):
 async def test_expired_session_returns_diagnostic_output(tmp_path: Path):
     workflow = make_workflow(tmp_path)
     executor = next(value for value in workflow.get_executors_list() if isinstance(value, DeliberationExecutor))
-    result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
+    result, _plan = await start_confirmed(
+        workflow, DevUiRequest("问题", agents=["a", "b"], report_agent="a")
+    )
     request = only_request(result)
     session = executor.sessions.pop(request.data.deliberation_id)
     await session.close()
@@ -237,3 +267,57 @@ async def test_devui_can_reopen_persisted_checkpoint_after_process_loss(tmp_path
     assert request.data.stage == "独立陈述"
     result = await workflow.run(responses={request.request_id: response_for(request, action="cancel")})
     assert "已取消" in result.get_outputs()[0]
+
+
+@pytest.mark.asyncio
+async def test_devui_user_can_modify_organizer_plan_before_start(tmp_path: Path):
+    workflow = make_workflow(tmp_path)
+    result = await workflow.run(
+        DevUiRequest("问题", organizer="a", interactive=False, convergence="never")
+    )
+    event = only_request(result)
+    assert isinstance(event.data, DevUiPlanRequest)
+    assert event.data.plan["source"] == "organizer"
+    assert all(set(item) == {"id", "name", "role"} for item in event.data.available_agents)
+    response = DevUiPlanResponse(
+        event.data.deliberation_id,
+        event.data.interrupt_id,
+        participants=[{"id": "a", "role": "反方"}, {"id": "b", "role": "报告人"}],
+        report_agent_id="b",
+    )
+    result = await workflow.run(responses={event.request_id: response})
+    assert result.get_request_info_events() == []
+    archive = tmp_path / "deliberations" / event.data.deliberation_id
+    archived = json.loads((archive / "result.json").read_text())
+    assert archived["plan"]["report_agent_id"] == "b"
+    assert archived["plan"]["participants"] == [
+        {"id": "a", "role": "反方"},
+        {"id": "b", "role": "报告人"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_devui_rejects_unknown_agent_in_plan_confirmation(tmp_path: Path):
+    workflow = make_workflow(tmp_path)
+    result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
+    event = only_request(result)
+    response = DevUiPlanResponse(
+        event.data.deliberation_id,
+        event.data.interrupt_id,
+        participants=[{"id": "a"}, {"id": "unknown"}],
+        report_agent_id="a",
+    )
+    result = await workflow.run(responses={event.request_id: response})
+    replacement = only_request(result)
+    assert isinstance(replacement.data, DevUiPlanRequest)
+    assert replacement.request_id != event.request_id
+    assert any(event.type == "warning" and "未知或预检失败" in event.data for event in result)
+    await workflow.run(
+        responses={
+            replacement.request_id: DevUiPlanResponse(
+                replacement.data.deliberation_id,
+                replacement.data.interrupt_id,
+                action="cancel",
+            )
+        }
+    )

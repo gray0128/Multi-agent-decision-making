@@ -224,6 +224,7 @@ class DeliberationEngine:
                 list(state.warnings),
                 list(state.participants),
                 dict(state.convergence),
+                self._plan_payload(state, request),
             )
             state.status = result.status
             state.active_stage = None
@@ -255,6 +256,7 @@ class DeliberationEngine:
             report_agent = self._profile(state.report_agent_id)
             if report_agent not in selected:
                 raise DeliberationError("持久化状态中的报告 Agent 不在参与者中")
+            archive.save_plan(self._plan_payload(state, request))
             return selected, report_agent
 
         selected = [self._profile(agent_id) for agent_id in request.agent_ids]
@@ -273,6 +275,9 @@ class DeliberationEngine:
                 healthy_ids.add(profile.id)
             else:
                 failures[profile.id] = result.error or "未知预检失败"
+        if failures:
+            details = "；".join(f"{agent_id}: {error}" for agent_id, error in failures.items())
+            raise DeliberationError(f"已确认审议方案中的参与者预检失败：{details}")
         selected = [profile for profile in selected if profile.id in healthy_ids]
         if len(selected) < 2:
             details = "；".join(f"{agent_id}: {error}" for agent_id, error in failures.items())
@@ -285,8 +290,21 @@ class DeliberationEngine:
         state.completed_stages.append(PREFLIGHT_STAGE)
         state.active_stage = None
         archive.save_state(state)
+        archive.save_plan(self._plan_payload(state, request))
         archive.event({"type": "stage_committed", "stage": PREFLIGHT_STAGE, "participants": state.participants})
         return selected, report_agent
+
+    @staticmethod
+    def _plan_payload(state, request):
+        return {
+            "participants": [
+                {"id": agent_id, "role": request.roles.get(agent_id, "")}
+                for agent_id in state.participants
+            ],
+            "report_agent_id": state.report_agent_id,
+            "organizer_agent_id": request.organizer_agent_id,
+            "source": "organizer" if request.organizer_agent_id else "manual",
+        }
 
     async def _run_parallel_stage(
         self,
@@ -313,6 +331,7 @@ class DeliberationEngine:
             stage,
             archive,
             parse_revision_signal=parse_revision_signal,
+            roles=request.roles,
         )
         if len(results) < minimum_success:
             self._record_partial_outputs(archive, stage, results, reason="成功参与者不足")
@@ -325,7 +344,13 @@ class DeliberationEngine:
         state.begin_stage(stage, prompt)
         archive.save_state(state)
         progress(f"开始阶段：{stage.value}")
-        result = await self._one(profile, prompt, workdir, stage, archive)
+        result = await self._one(
+            profile,
+            self._with_role(prompt, request.roles.get(profile.id, "")),
+            workdir,
+            stage,
+            archive,
+        )
         self._commit_stage(state, archive, stage, [result])
         return result
 
@@ -450,7 +475,7 @@ class DeliberationEngine:
             try:
                 organized = await self._one(
                     report_agent,
-                    organization_prompt,
+                    self._with_role(organization_prompt, request.roles.get(report_agent.id, "")),
                     workdir,
                     Stage.DISPUTE_ORGANIZATION,
                     archive,
@@ -530,12 +555,23 @@ class DeliberationEngine:
             return request.workspace.expanduser().resolve(), False
         return create_snapshot(request.workspace, self.home / "temp" / archive_id), True
 
-    async def _parallel(self, profiles, prompt, cwd, stage, archive, *, parse_revision_signal=False):
+    async def _parallel(
+        self,
+        profiles,
+        prompt,
+        cwd,
+        stage,
+        archive,
+        *,
+        parse_revision_signal=False,
+        roles=None,
+    ):
+        roles = roles or {}
         tasks = [
             asyncio.create_task(
                 self._one(
                     profile,
-                    prompt,
+                    self._with_role(prompt, roles.get(profile.id, "")),
                     cwd,
                     stage,
                     archive,
@@ -570,6 +606,11 @@ class DeliberationEngine:
             else:
                 results.append(item)
         return results
+
+    @staticmethod
+    def _with_role(prompt: str, role: str) -> str:
+        role = role.strip()
+        return f"{prompt}\n\n你的本次临时角色：\n{role}" if role else prompt
 
     @staticmethod
     def _record_partial_outputs(archive, stage, items, *, reason):
