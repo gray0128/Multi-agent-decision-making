@@ -182,7 +182,7 @@ async def test_two_pi_model_agents_remain_distinct_in_formal_record(tmp_path: Pa
         (tmp_path / name).mkdir()
     profiles = [
         AgentProfile("pi-deepseek", "Pi · DeepSeek V4 Pro", "pi", model="deepseek/deepseek-v4-pro"),
-        AgentProfile("pi-minimax", "Pi · MiniMax-M3", "pi", model="minimax/minimax-m3"),
+        AgentProfile("pi-minimax", "Pi · MiniMax-M3", "pi", model="minimax/MiniMax-M3"),
     ]
     engine = DeliberationEngine(profiles, tmp_path, adapter_factory=FakeAdapter)
     result = await engine.run(
@@ -195,7 +195,7 @@ async def test_two_pi_model_agents_remain_distinct_in_formal_record(tmp_path: Pa
     }
     assert identities == {
         ("pi-deepseek", "Pi · DeepSeek V4 Pro", "pi", "deepseek/deepseek-v4-pro"),
-        ("pi-minimax", "Pi · MiniMax-M3", "pi", "minimax/minimax-m3"),
+        ("pi-minimax", "Pi · MiniMax-M3", "pi", "minimax/MiniMax-M3"),
     }
 
 

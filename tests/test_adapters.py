@@ -137,11 +137,11 @@ def test_output_parser_uses_only_final_pi_assistant_message():
 
 def test_two_pi_models_share_adapter_but_keep_distinct_commands(tmp_path: Path):
     deepseek = profile("pi", id="pi-deepseek", name="Pi DeepSeek", model="deepseek/deepseek-v4-pro")
-    minimax = profile("pi", id="pi-minimax", name="Pi MiniMax", model="minimax/minimax-m3")
+    minimax = profile("pi", id="pi-minimax", name="Pi MiniMax", model="minimax/MiniMax-M3")
     deepseek_command, _ = CliAdapter(deepseek).command(tmp_path, "PROMPT")
     minimax_command, _ = CliAdapter(minimax).command(tmp_path, "PROMPT")
     assert deepseek_command[deepseek_command.index("--model") + 1] == "deepseek/deepseek-v4-pro"
-    assert minimax_command[minimax_command.index("--model") + 1] == "minimax/minimax-m3"
+    assert minimax_command[minimax_command.index("--model") + 1] == "minimax/MiniMax-M3"
     assert deepseek.id != minimax.id and deepseek.name != minimax.name
 
 
