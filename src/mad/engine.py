@@ -6,7 +6,7 @@ import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
-from .adapters import AdapterError, CliAdapter
+from .adapters import AdapterError, CliAdapter, PreflightResult
 from .archive import Archive
 from .disputes import parse_dispute_list, parse_revision, raw_union
 from .models import AgentProfile, Contribution, DeliberationRequest, RunResult, Stage
@@ -53,13 +53,25 @@ class DeliberationEngine:
         convergence_info = {"strategy": request.convergence, "triggered": False, "reason": "阈值未满足", "marked_participants": 0, "disputes": [], "status": "未触发"}
         try:
             progress("正在预检参与者")
-            preflight = await self._parallel(selected, "只回复 READY，不要执行任何工具。", workdir, Stage.OPENING, archive, preflight=True)
-            healthy_ids = {item.agent_id for item in preflight}
+            preflight = await asyncio.gather(
+                *(self._preflight(profile, workdir, project_mode=request.workspace is not None) for profile in selected)
+            )
+            healthy_ids = set()
+            preflight_errors = {}
+            for profile, result in zip(selected, preflight, strict=True):
+                archive.diagnostic({"stage": "预检", "agent_id": profile.id, **result.to_dict()})
+                if result.ready:
+                    healthy_ids.add(profile.id)
+                else:
+                    preflight_errors[profile.id] = result.error or "未知预检失败"
             selected = [item for item in selected if item.id in healthy_ids]
             if len(selected) < 2:
-                raise DeliberationError("预检后可用参与者不足两个")
+                details = "；".join(f"{agent_id}: {error}" for agent_id, error in preflight_errors.items())
+                raise DeliberationError(f"预检后可用参与者不足两个：{details}")
             if report_agent not in selected:
-                raise DeliberationError("报告 Agent 预检失败")
+                raise DeliberationError(
+                    f"报告 Agent 预检失败：{preflight_errors.get(report_agent.id, '未知预检失败')}"
+                )
 
             phases = [
                 (Stage.OPENING, "独立分析问题。明确结论、理由、假设、风险与资料来源，不参考其他参与者。"),
@@ -206,7 +218,7 @@ class DeliberationEngine:
             return request.workspace.expanduser().resolve(), False
         return create_snapshot(request.workspace, self.home / "temp" / archive_id), True
 
-    async def _parallel(self, profiles, prompt, cwd, stage, archive, *, preflight=False, parse_revision_signal=False):
+    async def _parallel(self, profiles, prompt, cwd, stage, archive, *, parse_revision_signal=False):
         gathered = await asyncio.gather(
             *(
                 self._one(
@@ -215,7 +227,6 @@ class DeliberationEngine:
                     cwd,
                     stage,
                     archive,
-                    preflight=preflight,
                     parse_revision_signal=parse_revision_signal,
                 )
                 for profile in profiles
@@ -230,7 +241,18 @@ class DeliberationEngine:
                 results.append(item)
         return results
 
-    async def _one(self, profile, prompt, cwd, stage, archive, *, preflight=False, parse_revision_signal=False):
+    async def _preflight(self, profile, cwd, *, project_mode):
+        adapter = self.adapter_factory(profile)
+        preflight = getattr(adapter, "preflight", None)
+        if preflight:
+            return await preflight(cwd, project_mode=project_mode)
+        try:
+            await adapter.invoke("只回复 READY，不要执行任何工具。", cwd)
+        except AdapterError as exc:
+            return PreflightResult(True, False, True, 0, str(exc))
+        return PreflightResult(True, True, True, 0)
+
+    async def _one(self, profile, prompt, cwd, stage, archive, *, parse_revision_signal=False):
         async with self.semaphore:
             last_error = None
             for attempt in (1, 2):
@@ -247,8 +269,7 @@ class DeliberationEngine:
                     contribution = Contribution(
                         stage, profile.id, profile.name, text, result.duration_seconds, attempt, metadata
                     )
-                    if not preflight:
-                        archive.append(contribution)
+                    archive.append(contribution)
                     return contribution
                 except AdapterError as exc:
                     last_error = exc
