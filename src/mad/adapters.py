@@ -126,7 +126,7 @@ class CliAdapter:
 
     @property
     def supports_project_read_only(self) -> bool:
-        return self.profile.adapter.lower() in {"codex", "claude", "claudecode", "grok", "pi", "codebuddy"}
+        return self.profile.adapter.lower() in {"codex", "claude", "claudecode", "grok", "pi", "codebuddy", "agy"}
 
     def command(self, cwd: Path, prompt: str) -> tuple[list[str], bytes | None]:
         model = ["--model", self.profile.model] if self.profile.model else []
@@ -242,6 +242,22 @@ class CliAdapter:
                         "user",
                         *model,
                         *extra,
+                        prompt,
+                    ],
+                    None,
+                )
+            case "agy":
+                return (
+                    [
+                        self.executable,
+                        "--mode",
+                        "plan",
+                        "--sandbox",
+                        "--print-timeout",
+                        f"{max(1, self.profile.timeout_seconds)}s",
+                        *model,
+                        *extra,
+                        "--print",
                         prompt,
                     ],
                     None,

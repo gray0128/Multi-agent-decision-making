@@ -76,6 +76,21 @@ def profile(adapter: str, **overrides) -> AgentProfile:
             ],
             False,
         ),
+        (
+            "agy",
+            [
+                "--mode",
+                "plan",
+                "--sandbox",
+                "--print-timeout",
+                "300s",
+                "--model",
+                "test-model",
+                "--print",
+                "PROMPT",
+            ],
+            False,
+        ),
     ],
 )
 def test_real_cli_command_contracts(tmp_path: Path, adapter: str, expected: list[str], stdin_expected: bool):
@@ -167,9 +182,10 @@ def test_two_pi_models_share_adapter_but_keep_distinct_commands(tmp_path: Path):
                 ]
             ).encode(),
         ),
+        ("agy", b"READY\n"),
     ],
 )
-async def test_pi_and_codebuddy_complete_normalized_plain_text_invocation(
+async def test_project_adapters_complete_normalized_plain_text_invocation(
     monkeypatch, tmp_path: Path, adapter: str, stdout: bytes
 ):
     process = FakeProcess(stdout=stdout)
@@ -349,6 +365,6 @@ async def test_unproven_read_only_adapter_is_rejected_before_model_call(monkeypa
     assert "禁止项目模式" in result.error
 
 
-@pytest.mark.parametrize("adapter", ["pi", "codebuddy"])
-def test_pi_and_codebuddy_declare_minimum_project_read_only_capability(adapter):
+@pytest.mark.parametrize("adapter", ["pi", "codebuddy", "agy"])
+def test_project_adapters_declare_minimum_read_only_capability(adapter):
     assert CliAdapter(profile(adapter)).supports_project_read_only is True

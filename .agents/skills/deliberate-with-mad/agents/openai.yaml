@@ -1,0 +1,4 @@
+interface:
+  display_name: "使用 MAD 自动审议"
+  short_description: "调用本项目以全自动模式完成只读多 Agent 结构化审议"
+  default_prompt: "Use $deliberate-with-mad to automatically deliberate this project and return the final report."

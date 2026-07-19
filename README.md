@@ -13,7 +13,7 @@
 - Python 3.12；
 - [uv](https://docs.astral.sh/uv/)；
 - 至少两个已安装、已认证且支持非交互调用的 CLI；
-- 可选 CLI：Codex、Claude Code、Reasonix、Grok、Pi、CodeBuddy。
+- 可选 CLI：Codex、Claude Code、Reasonix、Grok、Pi、CodeBuddy、Antigravity CLI（`agy`）。
 
 从仓库安装为独立工具：
 
@@ -107,6 +107,18 @@ default_report = false
 timeout_seconds = 300
 context_budget = 64000
 extra_args = []
+
+[[agents]]
+id = "agy-gemini-flash"
+name = "Antigravity · Gemini 3.5 Flash Low"
+adapter = "agy"
+model = "Gemini 3.5 Flash (Low)"
+role = "侧重快速核验实现证据和交付风险"
+enabled = true
+default_report = false
+timeout_seconds = 300
+context_budget = 1000000
+extra_args = []
 ```
 
 字段说明：
@@ -115,7 +127,7 @@ extra_args = []
 |---|---|
 | `id` | 唯一且稳定的 Agent ID；写入记录、恢复状态和 JSON 输出 |
 | `name` | 展示名称 |
-| `adapter` | `codex`、`claude`、`reasonix`、`grok`、`pi` 或 `codebuddy` |
+| `adapter` | `codex`、`claude`、`reasonix`、`grok`、`pi`、`codebuddy` 或 `agy` |
 | `model` | 可选模型 ID；Pi 推荐使用精确的 `provider/model` |
 | `role` | 默认角色说明；单次审议可用 `--role` 覆盖 |
 | `executable` | 可选可执行文件名或路径；省略时按 `adapter` 从 `PATH` 查找 |
@@ -387,7 +399,17 @@ mad agents
 
 ### 项目模式被拒绝
 
-适配器必须证明最低只读约束。Codex、Claude Code、Grok、Pi 和 CodeBuddy 支持项目只读模式；Reasonix 当前只支持纯文本审议。不要为了绕过预检自动切换到 `--direct-workspace`。
+适配器必须证明最低只读约束。Codex、Claude Code、Grok、Pi、CodeBuddy 和 Agy 支持项目只读模式；Agy 固定使用 `--mode plan --sandbox`。Reasonix 当前只支持纯文本审议。不要为了绕过预检自动切换到 `--direct-workspace`。
+
+### Agy 找不到模型或无法启动
+
+```bash
+agy --version
+agy agents
+agy models
+```
+
+`model` 必须使用 `agy models` 或 `agy agents` 显示的完整名称，例如 `Gemini 3.5 Flash (Low)`。Agy 会写入自己的日志并启动 localhost 语言服务；请先在普通终端完成认证和首次工作目录信任。MAD 不会传入 `--dangerously-skip-permissions`。
 
 ### Pi 多模型找不到模型
 

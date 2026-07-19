@@ -7,7 +7,7 @@ def test_initialize_creates_registry(tmp_path: Path):
     target = initialize(tmp_path)
     assert target.exists()
     profiles = load_agents(target)
-    assert {item.adapter for item in profiles} == {"codex", "claude", "reasonix", "grok", "pi", "codebuddy"}
+    assert {item.adapter for item in profiles} == {"codex", "claude", "reasonix", "grok", "pi", "codebuddy", "agy"}
 
 
 def test_duplicate_ids_are_rejected(tmp_path: Path):

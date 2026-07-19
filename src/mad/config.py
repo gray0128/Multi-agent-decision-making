@@ -39,7 +39,9 @@ def load_agents(path: Path | None = None) -> list[AgentProfile]:
 
 
 def default_agents_toml() -> str:
-    detected = {name: shutil.which(name) for name in ("codex", "claude", "reasonix", "grok", "pi", "codebuddy")}
+    detected = {
+        name: shutil.which(name) for name in ("codex", "claude", "reasonix", "grok", "pi", "codebuddy", "agy")
+    }
     blocks = ["# Agent 注册表。秘密继续由各 CLI 自己管理，请勿写入本文件。\n"]
     for index, (adapter, executable) in enumerate(detected.items()):
         blocks.append(
