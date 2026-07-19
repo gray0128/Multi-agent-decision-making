@@ -4,6 +4,7 @@ import asyncio
 import json
 import shutil
 from collections.abc import Awaitable, Callable
+from dataclasses import asdict
 from pathlib import Path
 
 from .adapters import AdapterError, CliAdapter, PreflightResult
@@ -11,10 +12,14 @@ from .archive import Archive
 from .disputes import parse_dispute_list, parse_revision, raw_union
 from .models import AgentProfile, CheckpointDecision, Contribution, DeliberationRequest, RunResult, Stage
 from .snapshot import create_snapshot
+from .state import DeliberationState
 
 
 Checkpoint = Callable[[Stage, list[Contribution]], Awaitable[CheckpointDecision | str | None]]
 Progress = Callable[[str], None]
+PREFLIGHT_STAGE = "预检"
+ACTIVE_MARKER = ".mad-active"
+RECOVERABLE_MARKER = ".mad-recoverable"
 
 
 class DeliberationError(RuntimeError):
@@ -48,231 +53,473 @@ class DeliberationEngine:
             raise DeliberationError("报告 Agent 必须是参与者")
         archive = Archive(self.home, archive_id=deliberation_id)
         archive.start(request)
-        workdir, temporary = self._workspace(request, archive.id)
-        active_marker = workdir / ".mad-active" if temporary else None
-        if active_marker:
-            active_marker.write_text(archive.id, encoding="utf-8")
-        transcript: list[Contribution] = []
-        warnings: list[str] = []
-        guidance: list[str] = []
-        convergence_info = {"strategy": request.convergence, "triggered": False, "reason": "阈值未满足", "marked_participants": 0, "disputes": [], "status": "未触发"}
         try:
-            progress("正在预检参与者")
-            preflight = await asyncio.gather(
-                *(self._preflight(profile, workdir, project_mode=request.workspace is not None) for profile in selected)
-            )
-            healthy_ids = set()
-            preflight_errors = {}
-            for profile, result in zip(selected, preflight, strict=True):
-                archive.diagnostic({"stage": "预检", "agent_id": profile.id, **result.to_dict()})
-                if result.ready:
-                    healthy_ids.add(profile.id)
-                else:
-                    preflight_errors[profile.id] = result.error or "未知预检失败"
-            selected = [item for item in selected if item.id in healthy_ids]
-            if len(selected) < 2:
-                details = "；".join(f"{agent_id}: {error}" for agent_id, error in preflight_errors.items())
-                raise DeliberationError(f"预检后可用参与者不足两个：{details}")
-            if report_agent not in selected:
-                raise DeliberationError(
-                    f"报告 Agent 预检失败：{preflight_errors.get(report_agent.id, '未知预检失败')}"
-                )
-
-            phases = [
-                (Stage.OPENING, "独立分析问题。明确结论、理由、假设、风险与资料来源，不参考其他参与者。"),
-                (Stage.CRITIQUE, "阅读已有陈述，指出事实错误、遗漏、冲突和最强反例，并给出补充。"),
-            ]
-            for stage, instruction in phases:
-                progress(f"开始阶段：{stage.value}")
-                prompt = self._prompt(request, instruction, transcript, guidance)
-                results = await self._parallel(selected, prompt, workdir, stage, archive)
-                transcript.extend(results)
-                if len(results) < 2:
-                    raise DeliberationError(f"{stage.value}成功参与者不足两个")
-                if checkpoint and stage in {Stage.OPENING, Stage.CRITIQUE}:
-                    decision = await checkpoint(stage, results)
-                    self._apply_standard_checkpoint(decision, stage, guidance, archive)
-
-            progress(f"开始阶段：{Stage.REVISION.value}")
-            revision_instruction = """综合已有陈述、质疑和用户指导，提交修订后的判断及其依据。正文后必须附带一个 ```json 代码块，格式为：
-{"has_critical_dispute": true或false, "disputes": [{"title": "具体争议", "impact": "为何实质改变最终结论"}]}。
-没有关键未决争议时 disputes 必须为空。一般观点差异不得标记为关键争议。"""
-            revisions = await self._parallel(
-                selected,
-                self._prompt(request, revision_instruction, transcript, guidance),
-                workdir,
-                Stage.REVISION,
-                archive,
-                parse_revision_signal=True,
-            )
-            transcript.extend(revisions)
-            if len(revisions) < 2:
-                raise DeliberationError("修订意见成功参与者不足两个")
-            for item in revisions:
-                if warning := item.metadata.get("signal_warning"):
-                    warnings.append(f"{item.agent_name}：{warning}")
-
-            signals = [
-                (item.agent_id, item.metadata["dispute_signal"])
-                for item in revisions
-                if item.metadata.get("dispute_signal")
-            ]
-            marked_count = sum(1 for _, signal in signals if signal.get("has_critical_dispute"))
-            convergence_info["marked_participants"] = marked_count
-            strategy = request.convergence
-            if strategy not in {"auto", "always", "never"}:
-                raise DeliberationError(f"未知争议收敛策略：{strategy}")
-            should_converge = strategy == "always" or (strategy == "auto" and marked_count >= 2)
-            if strategy == "always":
-                convergence_info["reason"] = "策略强制触发"
-            elif should_converge:
-                convergence_info["reason"] = "至少两名参与者标记关键争议"
-            if strategy == "never":
-                should_converge = False
-                convergence_info["reason"] = "策略禁止触发"
-            if checkpoint:
-                decision = await checkpoint(Stage.DISPUTE_DECISION, revisions)
-                if isinstance(decision, CheckpointDecision):
-                    if decision.action == "cancel":
-                        raise DeliberationCancelled("用户取消审议")
-                    note = decision.guidance.strip()
-                    if note:
-                        guidance.append(note)
-                        archive.event(
-                            {"type": "user_guidance", "after_stage": Stage.DISPUTE_DECISION.value, "text": note}
-                        )
-                    if decision.action == "skip":
-                        should_converge = False
-                        convergence_info["reason"] = "用户跳过"
-                        archive.event(
-                            {"type": "dispute_override", "action": "skip", "stage": Stage.DISPUTE_DECISION.value}
-                        )
-                    elif decision.action == "trigger":
-                        should_converge = True
-                        convergence_info["reason"] = "用户强制触发"
-                        archive.event(
-                            {"type": "dispute_override", "action": "trigger", "stage": Stage.DISPUTE_DECISION.value}
-                        )
-                    elif decision.action not in {"continue", "guidance"}:
-                        raise DeliberationError(f"争议判定检查点不支持动作：{decision.action}")
-                elif decision == "/skip":
-                    should_converge = False
-                    convergence_info["reason"] = "用户跳过"
-                    archive.event(
-                        {"type": "dispute_override", "action": "skip", "stage": Stage.DISPUTE_DECISION.value}
-                    )
-                elif decision and decision.startswith("/trigger"):
-                    should_converge = True
-                    convergence_info["reason"] = "用户强制触发"
-                    archive.event(
-                        {"type": "dispute_override", "action": "trigger", "stage": Stage.DISPUTE_DECISION.value}
-                    )
-                    extra = decision.removeprefix("/trigger").strip()
-                    if extra:
-                        guidance.append(extra)
-                        archive.event(
-                            {
-                                "type": "user_guidance",
-                                "after_stage": Stage.DISPUTE_DECISION.value,
-                                "text": extra,
-                            }
-                        )
-            convergence_info["triggered"] = should_converge
-
-            disputes = []
-            if should_converge:
-                progress("正在整理关键未决争议")
-                raw_disputes = raw_union([(agent, signal) for agent, signal in signals if signal.get("has_critical_dispute")])
-                organization_prompt = self._dispute_organization_prompt(request, transcript, raw_disputes, strategy)
-                try:
-                    organized = await self._one(
-                        report_agent, organization_prompt, workdir, Stage.DISPUTE_ORGANIZATION, archive
-                    )
-                    transcript.append(organized)
-                    disputes = parse_dispute_list(organized.text)
-                except DeliberationError as exc:
-                    warnings.append(f"争议整理失败，使用原始并集：{exc}")
-                if not disputes:
-                    disputes = raw_disputes
-                if not disputes:
-                    warnings.append("已请求争议收敛，但无法形成具体争议清单，已跳过")
-                    convergence_info["status"] = "无具体争议，已跳过"
-                else:
-                    convergence_info["disputes"] = disputes
-                    progress(f"开始阶段：{Stage.CONVERGENCE.value}")
-                    convergence_prompt = self._prompt(
-                        request, self._convergence_instruction(disputes), transcript, guidance
-                    )
-                    convergence = await self._parallel(
-                        selected, convergence_prompt, workdir, Stage.CONVERGENCE, archive
-                    )
-                    transcript.extend(convergence)
-                    if len(convergence) < 2:
-                        warnings.append("争议收敛轮成功参与者不足两名；所有争议保持未解决")
-                        convergence_info["status"] = "参与者不足，争议未解决"
-                    else:
-                        convergence_info["status"] = "已完成"
-
-            draft_prompt = self._prompt(request, self._report_instruction(final=False), transcript, guidance)
-            draft = await self._one(report_agent, draft_prompt, workdir, Stage.DRAFT, archive)
-            transcript.append(draft)
-            if checkpoint:
-                decision = await checkpoint(Stage.DRAFT, [draft])
-                self._apply_standard_checkpoint(decision, Stage.DRAFT, guidance, archive)
-            reviewers = [item for item in selected if item.id != report_agent.id]
-            review_prompt = self._prompt(request, "只审阅报告草稿，列出事实错误、关键遗漏、证据不足和必须修改之处。", transcript, guidance)
-            reviews = await self._parallel(reviewers, review_prompt, workdir, Stage.REVIEW, archive)
-            transcript.extend(reviews)
-            final_prompt = self._prompt(request, self._report_instruction(final=True), transcript, guidance)
-            final = await self._one(report_agent, final_prompt, workdir, Stage.FINAL, archive)
-            transcript.append(final)
-            result = RunResult(
-                archive.id,
-                "完成" if not warnings else "带警告完成",
-                final.text,
-                archive.path,
-                warnings,
-                [p.id for p in selected],
-                convergence_info,
-            )
-            archive.finish(result)
-            return result
-        except DeliberationCancelled as exc:
-            archive.event({"type": "cancelled", "reason": str(exc)})
-            archive.mark_status("已取消", reason=str(exc))
-            raise
-        except asyncio.CancelledError:
-            archive.event({"type": "cancelled", "reason": "审议任务已取消"})
-            archive.mark_status("已取消", reason="审议任务已取消")
-            raise
+            workdir, temporary = self._workspace(request, archive.id)
         except Exception as exc:
-            archive.event({"type": "failed", "error": str(exc)})
             archive.mark_status("失败", reason=str(exc))
             raise
+        state = DeliberationState.create(
+            archive.id,
+            request,
+            workdir,
+            temporary_workspace=temporary,
+        )
+        archive.save_state(state)
+        archive.replace_transcript([])
+        return await self._execute(archive, state, checkpoint=checkpoint, progress=progress)
+
+    async def resume(
+        self,
+        deliberation_id: str,
+        *,
+        checkpoint: Checkpoint | None = None,
+        progress: Progress = lambda _: None,
+    ) -> RunResult:
+        archive = Archive.open(self.home, deliberation_id)
+        state = archive.load_state()
+        if state.status in {"完成", "带警告完成"}:
+            raise DeliberationError(f"审议已经完成，不能恢复：{deliberation_id}")
+        return await self._execute(archive, state, checkpoint=checkpoint, progress=progress)
+
+    async def _execute(
+        self,
+        archive: Archive,
+        state: DeliberationState,
+        *,
+        checkpoint: Checkpoint | None,
+        progress: Progress,
+    ) -> RunResult:
+        request = state.to_request()
+        workdir = Path(state.workdir)
+        if not workdir.is_dir():
+            raise DeliberationError(f"恢复所需工作目录或快照不存在：{workdir}")
+        archive.replace_transcript(state.contributions())
+        self._mark_active(state)
+        state.status = "运行中"
+        archive.save_state(state)
+        archive.mark_status("运行中")
+        completed = False
+        try:
+            selected, report_agent = await self._ensure_preflight(state, request, workdir, archive, progress)
+
+            if state.pending_checkpoint:
+                await self._resolve_pending_checkpoint(state, archive, checkpoint)
+
+            if not state.stage_completed(Stage.OPENING):
+                opening = await self._run_parallel_stage(
+                    state,
+                    archive,
+                    selected,
+                    request,
+                    Stage.OPENING,
+                    "独立分析问题。明确结论、理由、假设、风险与资料来源，不参考其他参与者。",
+                    workdir,
+                    progress,
+                )
+                await self._checkpoint_after_stage(state, archive, Stage.OPENING, opening, checkpoint)
+
+            if not state.stage_completed(Stage.CRITIQUE):
+                critique = await self._run_parallel_stage(
+                    state,
+                    archive,
+                    selected,
+                    request,
+                    Stage.CRITIQUE,
+                    "阅读已有陈述，指出事实错误、遗漏、冲突和最强反例，并给出补充。",
+                    workdir,
+                    progress,
+                )
+                await self._checkpoint_after_stage(state, archive, Stage.CRITIQUE, critique, checkpoint)
+
+            if not state.stage_completed(Stage.REVISION):
+                revision_instruction = """综合已有陈述、质疑和用户指导，提交修订后的判断及其依据。正文后必须附带一个 ```json 代码块，格式为：
+{"has_critical_dispute": true或false, "disputes": [{"title": "具体争议", "impact": "为何实质改变最终结论"}]}。
+没有关键未决争议时 disputes 必须为空。一般观点差异不得标记为关键争议。"""
+                revisions = await self._run_parallel_stage(
+                    state,
+                    archive,
+                    selected,
+                    request,
+                    Stage.REVISION,
+                    revision_instruction,
+                    workdir,
+                    progress,
+                    parse_revision_signal=True,
+                )
+            if not state.stage_completed(Stage.DISPUTE_DECISION):
+                revisions = state.stage_items(Stage.REVISION)
+                for item in revisions:
+                    if warning := item.metadata.get("signal_warning"):
+                        message = f"{item.agent_name}：{warning}"
+                        if message not in state.warnings:
+                            state.warnings.append(message)
+                self._initialize_convergence(state, request, revisions)
+                archive.save_state(state)
+                await self._checkpoint_after_stage(
+                    state,
+                    archive,
+                    Stage.DISPUTE_DECISION,
+                    revisions,
+                    checkpoint,
+                )
+
+            if state.convergence.get("triggered"):
+                await self._run_convergence(
+                    state,
+                    archive,
+                    selected,
+                    report_agent,
+                    request,
+                    workdir,
+                    progress,
+                )
+
+            if not state.stage_completed(Stage.DRAFT):
+                draft = await self._run_single_stage(
+                    state,
+                    archive,
+                    report_agent,
+                    request,
+                    Stage.DRAFT,
+                    self._report_instruction(final=False),
+                    workdir,
+                    progress,
+                )
+                await self._checkpoint_after_stage(state, archive, Stage.DRAFT, [draft], checkpoint)
+
+            if not state.stage_completed(Stage.REVIEW):
+                reviewers = [item for item in selected if item.id != report_agent.id]
+                await self._run_parallel_stage(
+                    state,
+                    archive,
+                    reviewers,
+                    request,
+                    Stage.REVIEW,
+                    "只审阅报告草稿，列出事实错误、关键遗漏、证据不足和必须修改之处。",
+                    workdir,
+                    progress,
+                    minimum_success=1,
+                )
+
+            if not state.stage_completed(Stage.FINAL):
+                await self._run_single_stage(
+                    state,
+                    archive,
+                    report_agent,
+                    request,
+                    Stage.FINAL,
+                    self._report_instruction(final=True),
+                    workdir,
+                    progress,
+                )
+
+            final_items = state.stage_items(Stage.FINAL)
+            if len(final_items) != 1:
+                raise DeliberationError("最终修订阶段缺少唯一可提交输出")
+            result = RunResult(
+                state.deliberation_id,
+                "完成" if not state.warnings else "带警告完成",
+                final_items[0].text,
+                archive.path,
+                list(state.warnings),
+                list(state.participants),
+                dict(state.convergence),
+            )
+            state.status = result.status
+            state.active_stage = None
+            state.pending_checkpoint = None
+            archive.save_state(state)
+            archive.finish(result)
+            completed = True
+            return result
+        except DeliberationCancelled as exc:
+            self._mark_recoverable(state, archive, str(exc), event_type="cancelled")
+            raise
+        except asyncio.CancelledError:
+            self._mark_recoverable(state, archive, "审议任务已取消", event_type="cancelled")
+            raise
+        except Exception as exc:
+            self._mark_recoverable(state, archive, str(exc), event_type="failed")
+            raise
         finally:
-            if temporary:
-                active_marker.unlink(missing_ok=True)
+            if completed and state.temporary_workspace:
                 shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _ensure_preflight(self, state, request, workdir, archive, progress):
+        if state.stage_completed(PREFLIGHT_STAGE):
+            selected = [self._profile(agent_id) for agent_id in state.participants]
+            for profile in selected:
+                expected = state.profile_fingerprints.get(profile.id)
+                if expected != asdict(profile):
+                    raise DeliberationError(f"Agent 配置自上次运行后发生变化：{profile.id}")
+            report_agent = self._profile(state.report_agent_id)
+            if report_agent not in selected:
+                raise DeliberationError("持久化状态中的报告 Agent 不在参与者中")
+            return selected, report_agent
+
+        selected = [self._profile(agent_id) for agent_id in request.agent_ids]
+        report_agent = self._profile(request.report_agent_id)
+        state.begin_stage(PREFLIGHT_STAGE)
+        archive.save_state(state)
+        progress("正在预检参与者")
+        results = await asyncio.gather(
+            *(self._preflight(profile, workdir, project_mode=request.workspace is not None) for profile in selected)
+        )
+        healthy_ids = set()
+        failures = {}
+        for profile, result in zip(selected, results, strict=True):
+            archive.diagnostic({"kind": "preflight", "stage": PREFLIGHT_STAGE, "agent_id": profile.id, **result.to_dict()})
+            if result.ready:
+                healthy_ids.add(profile.id)
+            else:
+                failures[profile.id] = result.error or "未知预检失败"
+        selected = [profile for profile in selected if profile.id in healthy_ids]
+        if len(selected) < 2:
+            details = "；".join(f"{agent_id}: {error}" for agent_id, error in failures.items())
+            raise DeliberationError(f"预检后可用参与者不足两个：{details}")
+        if report_agent not in selected:
+            raise DeliberationError(f"报告 Agent 预检失败：{failures.get(report_agent.id, '未知预检失败')}")
+        state.participants = [profile.id for profile in selected]
+        state.report_agent_id = report_agent.id
+        state.profile_fingerprints = {profile.id: asdict(profile) for profile in selected}
+        state.completed_stages.append(PREFLIGHT_STAGE)
+        state.active_stage = None
+        archive.save_state(state)
+        archive.event({"type": "stage_committed", "stage": PREFLIGHT_STAGE, "participants": state.participants})
+        return selected, report_agent
+
+    async def _run_parallel_stage(
+        self,
+        state,
+        archive,
+        profiles,
+        request,
+        stage,
+        instruction,
+        workdir,
+        progress,
+        *,
+        parse_revision_signal=False,
+        minimum_success=2,
+    ):
+        prompt = self._persisted_stage_input(state, request, stage, instruction)
+        state.begin_stage(stage, prompt)
+        archive.save_state(state)
+        progress(f"开始阶段：{stage.value}")
+        results = await self._parallel(
+            profiles,
+            prompt,
+            workdir,
+            stage,
+            archive,
+            parse_revision_signal=parse_revision_signal,
+        )
+        if len(results) < minimum_success:
+            self._record_partial_outputs(archive, stage, results, reason="成功参与者不足")
+            raise DeliberationError(f"{stage.value}成功参与者不足{minimum_success}个")
+        self._commit_stage(state, archive, stage, results)
+        return results
+
+    async def _run_single_stage(self, state, archive, profile, request, stage, instruction, workdir, progress):
+        prompt = self._persisted_stage_input(state, request, stage, instruction)
+        state.begin_stage(stage, prompt)
+        archive.save_state(state)
+        progress(f"开始阶段：{stage.value}")
+        result = await self._one(profile, prompt, workdir, stage, archive)
+        self._commit_stage(state, archive, stage, [result])
+        return result
+
+    def _commit_stage(self, state, archive, stage, items):
+        state.commit_stage(stage, items)
+        archive.save_state(state)
+        archive.replace_transcript(state.contributions())
+        archive.event(
+            {
+                "type": "stage_committed",
+                "stage": stage.value if isinstance(stage, Stage) else stage,
+                "contribution_count": len(items),
+            }
+        )
+
+    def _persisted_stage_input(self, state, request, stage, instruction):
+        value = stage.value if isinstance(stage, Stage) else stage
+        if state.active_stage == value and value in state.stage_inputs:
+            return state.stage_inputs[value]
+        return self._prompt(request, instruction, state.contributions(), state.guidance)
+
+    async def _checkpoint_after_stage(self, state, archive, stage, items, checkpoint):
+        state.pending_checkpoint = stage.value
+        archive.save_state(state)
+        if checkpoint is None and state.request.get("interactive"):
+            raise DeliberationError(f"审议正在等待{stage.value}检查点；恢复时必须启用交互模式")
+        decision = await checkpoint(stage, items) if checkpoint else None
+        self._apply_checkpoint_decision(state, archive, stage, decision)
+        state.pending_checkpoint = None
+        archive.save_state(state)
+
+    async def _resolve_pending_checkpoint(self, state, archive, checkpoint):
+        stage = Stage(state.pending_checkpoint)
+        source_stage = Stage.REVISION if stage == Stage.DISPUTE_DECISION else stage
+        items = state.stage_items(source_stage)
+        if checkpoint is None:
+            raise DeliberationError(f"审议正在等待{stage.value}检查点；恢复时必须启用交互模式")
+        decision = await checkpoint(stage, items)
+        self._apply_checkpoint_decision(state, archive, stage, decision)
+        state.pending_checkpoint = None
+        archive.save_state(state)
+
+    def _apply_checkpoint_decision(self, state, archive, stage, decision):
+        if isinstance(decision, CheckpointDecision):
+            action = decision.action
+            note = decision.guidance.strip()
+        else:
+            value = decision.strip() if isinstance(decision, str) else ""
+            if stage == Stage.DISPUTE_DECISION and value == "/skip":
+                action, note = "skip", ""
+            elif stage == Stage.DISPUTE_DECISION and value.startswith("/trigger"):
+                action, note = "trigger", value.removeprefix("/trigger").strip()
+            else:
+                action, note = "guidance" if value else "continue", value
+        if action == "cancel":
+            raise DeliberationCancelled("用户取消审议")
+        if note:
+            state.guidance.append(note)
+            archive.event({"type": "user_guidance", "after_stage": stage.value, "text": note})
+        if stage == Stage.DISPUTE_DECISION:
+            if action == "skip":
+                state.convergence["triggered"] = False
+                state.convergence["reason"] = "用户跳过"
+                archive.event({"type": "dispute_override", "action": "skip", "stage": stage.value})
+            elif action == "trigger":
+                state.convergence["triggered"] = True
+                state.convergence["reason"] = "用户强制触发"
+                archive.event({"type": "dispute_override", "action": "trigger", "stage": stage.value})
+            elif action not in {"continue", "guidance"}:
+                raise DeliberationError(f"争议判定检查点不支持动作：{action}")
+            if not state.stage_completed(Stage.DISPUTE_DECISION):
+                state.completed_stages.append(Stage.DISPUTE_DECISION.value)
+        elif action not in {"continue", "guidance"}:
+            raise DeliberationError(f"{stage.value}检查点不支持动作：{action}")
+
+    def _initialize_convergence(self, state, request, revisions):
+        signals = [
+            (item.agent_id, item.metadata["dispute_signal"])
+            for item in revisions
+            if item.metadata.get("dispute_signal")
+        ]
+        marked_count = sum(1 for _, signal in signals if signal.get("has_critical_dispute"))
+        strategy = request.convergence
+        if strategy not in {"auto", "always", "never"}:
+            raise DeliberationError(f"未知争议收敛策略：{strategy}")
+        triggered = strategy == "always" or (strategy == "auto" and marked_count >= 2)
+        reason = "阈值未满足"
+        if strategy == "always":
+            reason = "策略强制触发"
+        elif triggered:
+            reason = "至少两名参与者标记关键争议"
+        elif strategy == "never":
+            triggered = False
+            reason = "策略禁止触发"
+        state.convergence.update(
+            {
+                "strategy": strategy,
+                "triggered": triggered,
+                "reason": reason,
+                "marked_participants": marked_count,
+            }
+        )
+
+    async def _run_convergence(self, state, archive, selected, report_agent, request, workdir, progress):
+        revisions = state.stage_items(Stage.REVISION)
+        signals = [
+            (item.agent_id, item.metadata["dispute_signal"])
+            for item in revisions
+            if item.metadata.get("dispute_signal") and item.metadata["dispute_signal"].get("has_critical_dispute")
+        ]
+        raw_disputes = raw_union(signals)
+        if not state.stage_completed(Stage.DISPUTE_ORGANIZATION):
+            organization_prompt = state.stage_inputs.get(Stage.DISPUTE_ORGANIZATION.value)
+            if state.active_stage != Stage.DISPUTE_ORGANIZATION.value or organization_prompt is None:
+                organization_prompt = self._dispute_organization_prompt(
+                    request, state.contributions(), raw_disputes, request.convergence
+                )
+            state.begin_stage(Stage.DISPUTE_ORGANIZATION, organization_prompt)
+            archive.save_state(state)
+            progress("正在整理关键未决争议")
+            organized = None
+            try:
+                organized = await self._one(
+                    report_agent,
+                    organization_prompt,
+                    workdir,
+                    Stage.DISPUTE_ORGANIZATION,
+                    archive,
+                )
+            except DeliberationError as exc:
+                state.warnings.append(f"争议整理失败，使用原始并集：{exc}")
+            disputes = parse_dispute_list(organized.text) if organized else []
+            if not disputes:
+                disputes = raw_disputes
+            state.convergence["disputes"] = disputes
+            self._commit_stage(
+                state,
+                archive,
+                Stage.DISPUTE_ORGANIZATION,
+                [organized] if organized else [],
+            )
+        disputes = list(state.convergence.get("disputes", []))
+        if not disputes:
+            state.warnings.append("已请求争议收敛，但无法形成具体争议清单，已跳过")
+            state.convergence["status"] = "无具体争议，已跳过"
+            if not state.stage_completed(Stage.CONVERGENCE):
+                self._commit_stage(state, archive, Stage.CONVERGENCE, [])
+            return
+        if not state.stage_completed(Stage.CONVERGENCE):
+            convergence = await self._run_parallel_stage(
+                state,
+                archive,
+                selected,
+                request,
+                Stage.CONVERGENCE,
+                self._convergence_instruction(disputes),
+                workdir,
+                progress,
+                minimum_success=1,
+            )
+        if state.stage_completed(Stage.CONVERGENCE):
+            convergence = state.stage_items(Stage.CONVERGENCE)
+            warning = "争议收敛轮成功参与者不足两名；所有争议保持未解决"
+            if len(convergence) < 2:
+                if warning not in state.warnings:
+                    state.warnings.append(warning)
+                state.convergence["status"] = "参与者不足，争议未解决"
+            else:
+                state.convergence["status"] = "已完成"
+            archive.save_state(state)
+
+    def _mark_active(self, state: DeliberationState) -> None:
+        if not state.temporary_workspace:
+            return
+        workdir = Path(state.workdir)
+        (workdir / RECOVERABLE_MARKER).unlink(missing_ok=True)
+        (workdir / ACTIVE_MARKER).write_text(state.deliberation_id, encoding="utf-8")
+
+    def _mark_recoverable(self, state, archive, reason, *, event_type):
+        state.status = "可恢复"
+        archive.save_state(state)
+        archive.mark_status("可恢复", reason=reason)
+        archive.event({"type": event_type, "reason": reason, "active_stage": state.active_stage})
+        if state.temporary_workspace:
+            workdir = Path(state.workdir)
+            if workdir.is_dir():
+                (workdir / ACTIVE_MARKER).unlink(missing_ok=True)
+                (workdir / RECOVERABLE_MARKER).write_text(state.deliberation_id, encoding="utf-8")
 
     def _profile(self, agent_id: str) -> AgentProfile:
         profile = self.profiles.get(agent_id)
         if not profile or not profile.enabled:
             raise DeliberationError(f"Agent 配置不可用：{agent_id}")
         return profile
-
-    @staticmethod
-    def _apply_standard_checkpoint(decision, stage, guidance, archive):
-        if isinstance(decision, CheckpointDecision):
-            if decision.action == "cancel":
-                raise DeliberationCancelled("用户取消审议")
-            if decision.action not in {"continue", "guidance"}:
-                raise DeliberationError(f"{stage.value}检查点不支持动作：{decision.action}")
-            note = decision.guidance.strip()
-        else:
-            note = decision.strip() if isinstance(decision, str) else ""
-        if note:
-            guidance.append(note)
-            archive.event({"type": "user_guidance", "after_stage": stage.value, "text": note})
 
     def _workspace(self, request: DeliberationRequest, archive_id: str) -> tuple[Path, bool]:
         if not request.workspace:
@@ -284,8 +531,8 @@ class DeliberationEngine:
         return create_snapshot(request.workspace, self.home / "temp" / archive_id), True
 
     async def _parallel(self, profiles, prompt, cwd, stage, archive, *, parse_revision_signal=False):
-        gathered = await asyncio.gather(
-            *(
+        tasks = [
+            asyncio.create_task(
                 self._one(
                     profile,
                     prompt,
@@ -294,17 +541,47 @@ class DeliberationEngine:
                     archive,
                     parse_revision_signal=parse_revision_signal,
                 )
-                for profile in profiles
-            ),
-            return_exceptions=True,
-        )
+            )
+            for profile in profiles
+        ]
+        try:
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            partial = []
+            for task in tasks:
+                if task.done() and not task.cancelled():
+                    try:
+                        item = task.result()
+                    except Exception:
+                        continue
+                    if isinstance(item, Contribution):
+                        partial.append(item)
+                elif not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self._record_partial_outputs(archive, stage, partial, reason="阶段取消")
+            raise
         results = []
         for profile, item in zip(profiles, gathered, strict=True):
-            if isinstance(item, Exception):
-                archive.diagnostic({"stage": stage.value, "agent_id": profile.id, "error": str(item)})
+            if isinstance(item, BaseException):
+                archive.diagnostic(
+                    {"kind": "call_error", "stage": stage.value, "agent_id": profile.id, "error": str(item)}
+                )
             else:
                 results.append(item)
         return results
+
+    @staticmethod
+    def _record_partial_outputs(archive, stage, items, *, reason):
+        for item in items:
+            archive.diagnostic(
+                {
+                    "kind": "partial_stage_output",
+                    "stage": stage.value,
+                    "reason": reason,
+                    "contribution": item.to_dict(),
+                }
+            )
 
     async def _preflight(self, profile, cwd, *, project_mode):
         adapter = self.adapter_factory(profile)
@@ -331,11 +608,9 @@ class DeliberationEngine:
                         metadata["dispute_signal"] = parsed.signal
                         if parsed.warning:
                             metadata["signal_warning"] = parsed.warning
-                    contribution = Contribution(
+                    return Contribution(
                         stage, profile.id, profile.name, text, result.duration_seconds, attempt, metadata
                     )
-                    archive.append(contribution)
-                    return contribution
                 except AdapterError as exc:
                     last_error = exc
             raise DeliberationError(f"{profile.name} 调用失败：{last_error}")

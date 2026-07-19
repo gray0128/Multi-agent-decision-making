@@ -27,6 +27,15 @@ uv run mad deliberate "快速汇总意见" --convergence never
 
 可用策略为 `auto`、`always` 和 `never`；一次审议最多执行一个争议收敛轮。
 
+交互式审议在检查点取消、进程退出或阶段异常后会保留状态与材料快照。使用输出中的审议 ID 从最后一个完整阶段恢复；未完成的并行阶段会由全部参与者重新执行：
+
+```bash
+uv run mad deliberate "比较两个迁移方案" --interactive
+uv run mad resume <审议ID> --interactive
+```
+
+自动模式的未完成审议可省略 `--interactive`。`mad clean-temp` 不会删除活动中或仍可恢复审议使用的快照。
+
 ## 可选实机适配器冒烟
 
 实机冒烟会调用已认证模型并可能产生费用，因此必须显式确认，且至少指定两个 Agent：

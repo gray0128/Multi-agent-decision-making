@@ -16,13 +16,14 @@ from .models import CheckpointDecision, Contribution, DeliberationRequest, RunRe
 
 @dataclass
 class DevUiRequest:
-    question: str
+    question: str = ""
     agents: list[str] = field(default_factory=list)
     report_agent: str = ""
     workspace: str = ""
     direct_workspace: bool = False
     convergence: str = "auto"
     interactive: bool = True
+    resume_id: str = ""
 
 
 @dataclass
@@ -63,11 +64,13 @@ class _LiveSession:
         deliberation_id: str,
         *,
         interactive: bool,
+        resume_existing: bool = False,
     ):
         self.engine = engine
         self.request = request
         self.deliberation_id = deliberation_id
         self.interactive = interactive
+        self.resume_existing = resume_existing
         self.boundaries: asyncio.Queue[DevUiCheckpointRequest | RunResult | _CancelledBoundary | _ErrorBoundary] = (
             asyncio.Queue()
         )
@@ -82,11 +85,11 @@ class _LiveSession:
 
     async def _drive(self) -> None:
         try:
-            result = await self.engine.run(
-                self.request,
-                checkpoint=self._checkpoint if self.interactive else None,
-                deliberation_id=self.deliberation_id,
-            )
+            options = {"checkpoint": self._checkpoint if self.interactive else None}
+            if self.resume_existing:
+                result = await self.engine.resume(self.deliberation_id, **options)
+            else:
+                result = await self.engine.run(self.request, deliberation_id=self.deliberation_id, **options)
         except DeliberationCancelled as exc:
             await self.boundaries.put(_CancelledBoundary(str(exc)))
         except asyncio.CancelledError:
@@ -211,6 +214,26 @@ class DeliberationExecutor(Executor):
 
     @handler
     async def deliberate(self, request: DevUiRequest, ctx: WorkflowContext[None, str]) -> None:
+        if request.resume_id:
+            if request.resume_id in self.sessions:
+                raise ValueError(f"审议仍在当前进程中运行：{request.resume_id}")
+            state = Archive.open(self.engine.home, request.resume_id).load_state()
+            session = _LiveSession(
+                self.engine,
+                state.to_request(),
+                request.resume_id,
+                interactive=request.interactive,
+                resume_existing=True,
+            )
+            self.sessions[request.resume_id] = session
+            session.start()
+            try:
+                await self._emit_next_boundary(session, ctx)
+            except asyncio.CancelledError:
+                self.sessions.pop(request.resume_id, None)
+                await session.close()
+                raise
+            return
         profiles = list(self.engine.profiles.values())
         enabled = [item.id for item in profiles if item.enabled]
         agents = request.agents or enabled
