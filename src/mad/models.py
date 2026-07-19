@@ -45,6 +45,12 @@ class DeliberationRequest:
     convergence: str = "auto"
 
 
+@dataclass(slots=True, frozen=True)
+class CheckpointDecision:
+    action: str = "continue"
+    guidance: str = ""
+
+
 @dataclass(slots=True)
 class Contribution:
     stage: Stage
