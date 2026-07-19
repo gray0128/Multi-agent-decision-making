@@ -9,15 +9,19 @@ from pathlib import Path
 from .adapters import AdapterError, CliAdapter, PreflightResult
 from .archive import Archive
 from .disputes import parse_dispute_list, parse_revision, raw_union
-from .models import AgentProfile, Contribution, DeliberationRequest, RunResult, Stage
+from .models import AgentProfile, CheckpointDecision, Contribution, DeliberationRequest, RunResult, Stage
 from .snapshot import create_snapshot
 
 
-Checkpoint = Callable[[Stage, list[Contribution]], Awaitable[str | None]]
+Checkpoint = Callable[[Stage, list[Contribution]], Awaitable[CheckpointDecision | str | None]]
 Progress = Callable[[str], None]
 
 
 class DeliberationError(RuntimeError):
+    pass
+
+
+class DeliberationCancelled(DeliberationError):
     pass
 
 
@@ -34,6 +38,7 @@ class DeliberationEngine:
         *,
         checkpoint: Checkpoint | None = None,
         progress: Progress = lambda _: None,
+        deliberation_id: str | None = None,
     ) -> RunResult:
         selected = [self._profile(agent_id) for agent_id in request.agent_ids]
         if len(selected) < 2:
@@ -41,7 +46,7 @@ class DeliberationEngine:
         report_agent = self._profile(request.report_agent_id)
         if report_agent not in selected:
             raise DeliberationError("报告 Agent 必须是参与者")
-        archive = Archive(self.home)
+        archive = Archive(self.home, archive_id=deliberation_id)
         archive.start(request)
         workdir, temporary = self._workspace(request, archive.id)
         active_marker = workdir / ".mad-active" if temporary else None
@@ -85,9 +90,8 @@ class DeliberationEngine:
                 if len(results) < 2:
                     raise DeliberationError(f"{stage.value}成功参与者不足两个")
                 if checkpoint and stage in {Stage.OPENING, Stage.CRITIQUE}:
-                    note = await checkpoint(stage, results)
-                    if note:
-                        guidance.append(note)
+                    decision = await checkpoint(stage, results)
+                    self._apply_standard_checkpoint(decision, stage, guidance, archive)
 
             progress(f"开始阶段：{Stage.REVISION.value}")
             revision_instruction = """综合已有陈述、质疑和用户指导，提交修订后的判断及其依据。正文后必须附带一个 ```json 代码块，格式为：
@@ -128,15 +132,51 @@ class DeliberationEngine:
                 convergence_info["reason"] = "策略禁止触发"
             if checkpoint:
                 decision = await checkpoint(Stage.DISPUTE_DECISION, revisions)
-                if decision == "/skip":
+                if isinstance(decision, CheckpointDecision):
+                    if decision.action == "cancel":
+                        raise DeliberationCancelled("用户取消审议")
+                    note = decision.guidance.strip()
+                    if note:
+                        guidance.append(note)
+                        archive.event(
+                            {"type": "user_guidance", "after_stage": Stage.DISPUTE_DECISION.value, "text": note}
+                        )
+                    if decision.action == "skip":
+                        should_converge = False
+                        convergence_info["reason"] = "用户跳过"
+                        archive.event(
+                            {"type": "dispute_override", "action": "skip", "stage": Stage.DISPUTE_DECISION.value}
+                        )
+                    elif decision.action == "trigger":
+                        should_converge = True
+                        convergence_info["reason"] = "用户强制触发"
+                        archive.event(
+                            {"type": "dispute_override", "action": "trigger", "stage": Stage.DISPUTE_DECISION.value}
+                        )
+                    elif decision.action not in {"continue", "guidance"}:
+                        raise DeliberationError(f"争议判定检查点不支持动作：{decision.action}")
+                elif decision == "/skip":
                     should_converge = False
                     convergence_info["reason"] = "用户跳过"
+                    archive.event(
+                        {"type": "dispute_override", "action": "skip", "stage": Stage.DISPUTE_DECISION.value}
+                    )
                 elif decision and decision.startswith("/trigger"):
                     should_converge = True
                     convergence_info["reason"] = "用户强制触发"
+                    archive.event(
+                        {"type": "dispute_override", "action": "trigger", "stage": Stage.DISPUTE_DECISION.value}
+                    )
                     extra = decision.removeprefix("/trigger").strip()
                     if extra:
                         guidance.append(extra)
+                        archive.event(
+                            {
+                                "type": "user_guidance",
+                                "after_stage": Stage.DISPUTE_DECISION.value,
+                                "text": extra,
+                            }
+                        )
             convergence_info["triggered"] = should_converge
 
             disputes = []
@@ -177,9 +217,8 @@ class DeliberationEngine:
             draft = await self._one(report_agent, draft_prompt, workdir, Stage.DRAFT, archive)
             transcript.append(draft)
             if checkpoint:
-                note = await checkpoint(Stage.DRAFT, [draft])
-                if note:
-                    guidance.append(note)
+                decision = await checkpoint(Stage.DRAFT, [draft])
+                self._apply_standard_checkpoint(decision, Stage.DRAFT, guidance, archive)
             reviewers = [item for item in selected if item.id != report_agent.id]
             review_prompt = self._prompt(request, "只审阅报告草稿，列出事实错误、关键遗漏、证据不足和必须修改之处。", transcript, guidance)
             reviews = await self._parallel(reviewers, review_prompt, workdir, Stage.REVIEW, archive)
@@ -198,6 +237,18 @@ class DeliberationEngine:
             )
             archive.finish(result)
             return result
+        except DeliberationCancelled as exc:
+            archive.event({"type": "cancelled", "reason": str(exc)})
+            archive.mark_status("已取消", reason=str(exc))
+            raise
+        except asyncio.CancelledError:
+            archive.event({"type": "cancelled", "reason": "审议任务已取消"})
+            archive.mark_status("已取消", reason="审议任务已取消")
+            raise
+        except Exception as exc:
+            archive.event({"type": "failed", "error": str(exc)})
+            archive.mark_status("失败", reason=str(exc))
+            raise
         finally:
             if temporary:
                 active_marker.unlink(missing_ok=True)
@@ -208,6 +259,20 @@ class DeliberationEngine:
         if not profile or not profile.enabled:
             raise DeliberationError(f"Agent 配置不可用：{agent_id}")
         return profile
+
+    @staticmethod
+    def _apply_standard_checkpoint(decision, stage, guidance, archive):
+        if isinstance(decision, CheckpointDecision):
+            if decision.action == "cancel":
+                raise DeliberationCancelled("用户取消审议")
+            if decision.action not in {"continue", "guidance"}:
+                raise DeliberationError(f"{stage.value}检查点不支持动作：{decision.action}")
+            note = decision.guidance.strip()
+        else:
+            note = decision.strip() if isinstance(decision, str) else ""
+        if note:
+            guidance.append(note)
+            archive.event({"type": "user_guidance", "after_stage": stage.value, "text": note})
 
     def _workspace(self, request: DeliberationRequest, archive_id: str) -> tuple[Path, bool]:
         if not request.workspace:
