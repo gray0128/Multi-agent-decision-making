@@ -33,7 +33,7 @@ async def run(args: argparse.Namespace) -> int:
     if not profiles:
         profiles = [
             AgentProfile(adapter, adapter.title(), adapter, executable=shutil.which(adapter))
-            for adapter in ("codex", "claude", "reasonix", "grok")
+            for adapter in ("codex", "claude", "reasonix", "grok", "pi", "codebuddy")
             if shutil.which(adapter)
         ]
     known = {profile.id for profile in profiles}

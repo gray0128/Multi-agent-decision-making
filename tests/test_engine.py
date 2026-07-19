@@ -155,8 +155,8 @@ async def test_confirmed_plan_roles_are_used_and_archived(tmp_path: Path):
     )
     assert result.plan == {
         "participants": [
-            {"id": "a", "role": "决策主张者"},
-            {"id": "b", "role": "风险质疑者"},
+            {"id": "a", "name": "A", "adapter": "fake", "model": None, "role": "决策主张者"},
+            {"id": "b", "name": "B", "adapter": "fake", "model": None, "role": "风险质疑者"},
         ],
         "report_agent_id": "a",
         "organizer_agent_id": "b",
@@ -171,6 +171,32 @@ async def test_confirmed_plan_roles_are_used_and_archived(tmp_path: Path):
     assert archived["plan"] == result.plan
     assert plan == result.plan
     assert state["request"]["roles"] == {"a": "决策主张者", "b": "风险质疑者"}
+    transcript = [json.loads(line) for line in (result.archive_path / "transcript.jsonl").read_text().splitlines()]
+    assert all(row["metadata"]["adapter"] == "fake" for row in transcript)
+    assert all("model" in row["metadata"] for row in transcript)
+
+
+@pytest.mark.asyncio
+async def test_two_pi_model_agents_remain_distinct_in_formal_record(tmp_path: Path):
+    for name in ("deliberations", "temp"):
+        (tmp_path / name).mkdir()
+    profiles = [
+        AgentProfile("pi-deepseek", "Pi · DeepSeek V4 Pro", "pi", model="deepseek/deepseek-v4-pro"),
+        AgentProfile("pi-minimax", "Pi · MiniMax-M3", "pi", model="minimax/minimax-m3"),
+    ]
+    engine = DeliberationEngine(profiles, tmp_path, adapter_factory=FakeAdapter)
+    result = await engine.run(
+        DeliberationRequest("问题", ["pi-deepseek", "pi-minimax"], "pi-deepseek", convergence="never")
+    )
+    rows = [json.loads(line) for line in (result.archive_path / "transcript.jsonl").read_text().splitlines()]
+    identities = {
+        (row["agent_id"], row["agent_name"], row["metadata"]["adapter"], row["metadata"]["model"])
+        for row in rows
+    }
+    assert identities == {
+        ("pi-deepseek", "Pi · DeepSeek V4 Pro", "pi", "deepseek/deepseek-v4-pro"),
+        ("pi-minimax", "Pi · MiniMax-M3", "pi", "minimax/minimax-m3"),
+    }
 
 
 @pytest.mark.asyncio
