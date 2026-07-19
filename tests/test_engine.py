@@ -3,9 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from mad.adapters import AdapterResult
+from mad.adapters import AdapterError, AdapterResult
+from mad.archive import Archive
 from mad.engine import DeliberationEngine
-from mad.models import AgentProfile, DeliberationRequest
+from mad.models import AgentProfile, DeliberationRequest, Stage
 
 
 class FakeAdapter:
@@ -45,6 +46,16 @@ class NoSignalAdapter(FakeAdapter):
         if "has_critical_dispute" in prompt and "只负责整理争议" not in prompt:
             return AdapterResult("缺少结构化信号的修订观点", 0.01, "")
         return await super().invoke(prompt, cwd)
+
+
+class FlakyAdapter(FakeAdapter):
+    attempts = 0
+
+    async def invoke(self, prompt, cwd):
+        self.__class__.attempts += 1
+        if self.__class__.attempts == 1:
+            raise AdapterError("暂时失败")
+        return AdapterResult("重试成功", 0.01, "重试成功")
 
 
 @pytest.mark.asyncio
@@ -101,3 +112,16 @@ async def test_always_can_propose_disputes_without_valid_signals(tmp_path: Path)
     engine = DeliberationEngine(profiles, tmp_path, adapter_factory=NoSignalAdapter)
     result = await engine.run(DeliberationRequest("问题", ["a", "b"], "a", convergence="always"))
     assert "争议收敛" in (result.archive_path / "transcript.jsonl").read_text()
+
+
+@pytest.mark.asyncio
+async def test_stage_call_retries_once_and_records_attempt(tmp_path: Path):
+    (tmp_path / "deliberations").mkdir()
+    profile = AgentProfile("a", "A", "fake")
+    engine = DeliberationEngine([profile], tmp_path, adapter_factory=FlakyAdapter)
+    archive = Archive(tmp_path)
+    FlakyAdapter.attempts = 0
+    result = await engine._one(profile, "PROMPT", tmp_path, Stage.OPENING, archive)
+    assert result.text == "重试成功"
+    assert result.attempts == 2
+    assert FlakyAdapter.attempts == 2
