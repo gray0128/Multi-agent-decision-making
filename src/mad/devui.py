@@ -272,10 +272,11 @@ class DeliberationExecutor(Executor):
         if len(healthy) < 2:
             raise ValueError("预检后可用参与者不足两个")
         allowed_ids = {item.id for item in healthy}
+        requested_agents = list(dict.fromkeys(request.agents))
         try:
             if request.organizer:
                 suggested = await planner.propose(request.question, request.organizer, healthy, planning_cwd)
-                agents = request.agents or suggested.agent_ids
+                agents = requested_agents or suggested.agent_ids
                 roles = {agent_id: suggested.roles.get(agent_id, "") for agent_id in agents}
                 roles.update(request.roles)
                 report = request.report_agent or suggested.report_agent_id
@@ -288,7 +289,7 @@ class DeliberationExecutor(Executor):
                     organizer_agent_id=request.organizer,
                 )
             else:
-                agents = request.agents or [item.id for item in healthy]
+                agents = requested_agents or [item.id for item in healthy]
                 report = request.report_agent or next(
                     (item.id for item in healthy if item.default_report), agents[0]
                 )

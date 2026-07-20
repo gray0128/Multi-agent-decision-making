@@ -49,6 +49,14 @@ def test_serve_uses_configured_auth_token_without_printing_it(monkeypatch, capsy
     assert captured["auth_token"] == "configured-token"
 
 
+def test_devui_usage_model_accepts_mapper_fallback_payload():
+    from agent_framework_devui._mapper import InputTokensDetails
+
+    details = InputTokensDetails(cached_tokens=0)
+
+    assert details.cached_tokens == 0
+
+
 class FakeAdapter:
     calls: list[tuple[str, str]] = []
 
@@ -185,6 +193,17 @@ async def test_automatic_devui_run_has_no_normal_checkpoints(tmp_path: Path):
     assert isinstance(plan.data, DevUiPlanRequest)
     assert result.get_request_info_events() == []
     assert result.get_outputs() == ["# 最终报告\n\n完成。"]
+
+
+@pytest.mark.asyncio
+async def test_devui_deduplicates_initial_agent_selection(tmp_path: Path):
+    workflow = make_workflow(tmp_path)
+
+    result = await workflow.run(DevUiRequest("问题", agents=["a", "a", "b"], report_agent="a"))
+
+    plan = only_request(result).data
+    assert isinstance(plan, DevUiPlanRequest)
+    assert [participant["id"] for participant in plan.plan["participants"]] == ["a", "b"]
 
 
 @pytest.mark.asyncio
