@@ -223,6 +223,7 @@ dependencies = [
     { name = "agent-framework-core" },
     { name = "agent-framework-devui" },
     { name = "openai" },
+    { name = "pydantic" },
 ]
 
 [package.dev-dependencies]
@@ -236,6 +237,7 @@ requires-dist = [
     { name = "agent-framework-core", specifier = "==1.11.0" },
     { name = "agent-framework-devui", specifier = "==1.0.0b260709" },
     { name = "openai", specifier = "==2.44.0" },
+    { name = "pydantic", specifier = "==2.13.4" },
 ]
 
 [package.metadata.requires-dev]

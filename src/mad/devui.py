@@ -10,6 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from agent_framework import Executor, WorkflowBuilder, WorkflowContext, WorkflowEvent, handler, response_handler
+from pydantic import TypeAdapter
 
 from .archive import Archive
 from .config import app_home, load_agents
@@ -18,8 +19,14 @@ from .models import CheckpointDecision, Contribution, DeliberationRequest, RunRe
 from .planning import DeliberationPlan, OrganizerService, PlanError, manual_plan, parse_plan_payload
 
 
+class _DevUiSchemaModel:
+    @classmethod
+    def model_json_schema(cls) -> dict[str, Any]:
+        return TypeAdapter(cls).json_schema()
+
+
 @dataclass
-class DevUiRequest:
+class DevUiRequest(_DevUiSchemaModel):
     question: str = ""
     agents: list[str] = field(default_factory=list)
     report_agent: str = ""
@@ -33,7 +40,7 @@ class DevUiRequest:
 
 
 @dataclass
-class DevUiPlanRequest:
+class DevUiPlanRequest(_DevUiSchemaModel):
     deliberation_id: str
     interrupt_id: str
     plan: dict[str, Any]
@@ -41,7 +48,7 @@ class DevUiPlanRequest:
 
 
 @dataclass
-class DevUiPlanResponse:
+class DevUiPlanResponse(_DevUiSchemaModel):
     deliberation_id: str
     interrupt_id: str
     action: str = "confirm"
@@ -50,7 +57,7 @@ class DevUiPlanResponse:
 
 
 @dataclass
-class DevUiCheckpointRequest:
+class DevUiCheckpointRequest(_DevUiSchemaModel):
     deliberation_id: str
     interrupt_id: str
     stage: str
@@ -62,7 +69,7 @@ class DevUiCheckpointRequest:
 
 
 @dataclass
-class DevUiCheckpointResponse:
+class DevUiCheckpointResponse(_DevUiSchemaModel):
     deliberation_id: str
     interrupt_id: str
     action: str = "continue"

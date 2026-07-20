@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
+from agent_framework_devui._utils import generate_input_schema
 
 from mad.adapters import AdapterResult
 from mad.devui import (
@@ -55,6 +56,25 @@ def test_devui_usage_model_accepts_mapper_fallback_payload():
     details = InputTokensDetails(cached_tokens=0)
 
     assert details.cached_tokens == 0
+
+
+def test_devui_boundary_models_publish_collection_schemas():
+    request_properties = generate_input_schema(DevUiRequest)["properties"]
+    assert request_properties["agents"]["type"] == "array"
+    assert request_properties["agents"]["items"]["type"] == "string"
+    assert request_properties["roles"]["type"] == "object"
+
+    plan_request_properties = generate_input_schema(DevUiPlanRequest)["properties"]
+    assert plan_request_properties["plan"]["type"] == "object"
+    assert plan_request_properties["available_agents"]["type"] == "array"
+
+    plan_response_properties = generate_input_schema(DevUiPlanResponse)["properties"]
+    assert plan_response_properties["participants"]["type"] == "array"
+
+    checkpoint_properties = generate_input_schema(DevUiCheckpointRequest)["properties"]
+    assert checkpoint_properties["actions"]["type"] == "array"
+    assert checkpoint_properties["participants"]["type"] == "array"
+    assert checkpoint_properties["disputes"]["type"] == "array"
 
 
 class FakeAdapter:
