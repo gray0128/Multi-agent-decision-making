@@ -319,7 +319,12 @@ class DeliberationExecutor(Executor):
         response=DevUiPlanResponse,
         workflow_output=str,
     )
-    async def confirm_plan(self, original_request, response, ctx) -> None:
+    async def confirm_plan(
+        self,
+        original_request: DevUiPlanRequest,
+        response: DevUiPlanResponse,
+        ctx,
+    ) -> None:
         pending = self.pending_plans.get(original_request.deliberation_id)
         error = self._validate_plan_response(pending, original_request, response, ctx.request_id)
         if error:
@@ -404,8 +409,8 @@ class DeliberationExecutor(Executor):
     )
     async def resume_deliberation(
         self,
-        original_request,
-        response,
+        original_request: DevUiCheckpointRequest,
+        response: DevUiCheckpointResponse,
         ctx,
     ) -> None:
         session = self.sessions.get(original_request.deliberation_id)

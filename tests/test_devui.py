@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 import pytest
-from agent_framework_devui._utils import generate_input_schema
+from agent_framework_devui._utils import extract_response_type_from_executor, generate_input_schema
 
 from mad.adapters import AdapterResult
 from mad.devui import (
@@ -110,6 +110,14 @@ def make_workflow(tmp_path: Path):
     ]
     engine = DeliberationEngine(profiles, tmp_path, adapter_factory=FakeAdapter)
     return build_workflow(engine)
+
+
+def test_devui_response_handlers_publish_structured_schemas(tmp_path: Path):
+    workflow = make_workflow(tmp_path)
+    executor = next(value for value in workflow.get_executors_list() if isinstance(value, DeliberationExecutor))
+
+    assert extract_response_type_from_executor(executor, DevUiPlanRequest) is DevUiPlanResponse
+    assert extract_response_type_from_executor(executor, DevUiCheckpointRequest) is DevUiCheckpointResponse
 
 
 def only_request(result):
