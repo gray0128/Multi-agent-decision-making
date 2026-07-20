@@ -30,8 +30,11 @@ mad --help
 
 ```bash
 git pull --ff-only
-uv tool install --force .
+uv tool install --force --reinstall-package multi-agent-decision .
 ```
+
+`--force` 只强制安装工具，不能保证重新构建版本号未变化的本地包。更新后的源码仍使用相同版本号时，必须同时使用
+`--reinstall-package multi-agent-decision`，否则 uv 可能复用旧构建缓存。
 
 卸载：
 
@@ -342,6 +345,22 @@ mad deliberate "比较候选实现并指出证据不足之处" \
 mad serve
 mad serve --port 8090 --no-open
 ```
+
+未配置 `DEVUI_AUTH_TOKEN` 时，终端会先显示本次进程使用的随机 Token：
+
+```text
+DevUI Bearer Token（仅本机使用，请勿分享）：
+<随机 Token>
+INFO:     Uvicorn running on http://127.0.0.1:8080
+```
+
+浏览器出现 `Authentication Required` 后，将该 Token 粘贴到输入框并连接。此时 `/meta` 返回 `401 Unauthorized`
+表示浏览器尚未携带有效 Token，并不表示服务启动失败。若终端没有显示 Token：
+
+1. 检查是否显式设置了 `DEVUI_AUTH_TOKEN`；设置后 MAD 会使用该值，但不会把已有密钥重新打印到日志；
+2. 如果刚从本地源码升级，执行 `uv tool install --force --reinstall-package multi-agent-decision .`，避免 uv
+   复用同版本号的旧构建；
+3. 重新运行 `mad serve`。
 
 固定安全边界：
 
