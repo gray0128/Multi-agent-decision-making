@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import secrets
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
@@ -454,11 +457,18 @@ def build_workflow(engine: DeliberationEngine | None = None):
 def serve(port: int = 8080, *, auto_open: bool = True) -> None:
     from agent_framework_devui import serve as devui_serve
 
+    auth_token = os.getenv("DEVUI_AUTH_TOKEN")
+    if not auth_token:
+        auth_token = secrets.token_urlsafe(32)
+        print("DevUI Bearer Token（仅本机使用，请勿分享）：", file=sys.stderr, flush=True)
+        print(auth_token, file=sys.stderr, flush=True)
+
     devui_serve(
         entities=[build_workflow()],
         host="127.0.0.1",
         port=port,
         auto_open=auto_open,
         auth_enabled=True,
+        auth_token=auth_token,
         instrumentation_enabled=True,
     )

@@ -14,9 +14,39 @@ from mad.devui import (
     DevUiPlanResponse,
     DevUiRequest,
     build_workflow,
+    serve,
 )
 from mad.engine import DeliberationCancelled, DeliberationEngine
 from mad.models import AgentProfile, CheckpointDecision, DeliberationRequest
+
+
+def test_serve_prints_generated_auth_token(monkeypatch, capsys):
+    captured = {}
+    monkeypatch.delenv("DEVUI_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr("mad.devui.secrets.token_urlsafe", lambda _size: "generated-token")
+    monkeypatch.setattr("mad.devui.build_workflow", lambda: "workflow")
+    monkeypatch.setattr("agent_framework_devui.serve", lambda **kwargs: captured.update(kwargs))
+
+    serve(9090, auto_open=False)
+
+    assert capsys.readouterr().err == "DevUI Bearer Token（仅本机使用，请勿分享）：\ngenerated-token\n"
+    assert captured["auth_token"] == "generated-token"
+    assert captured["auth_enabled"] is True
+    assert captured["host"] == "127.0.0.1"
+    assert captured["port"] == 9090
+    assert captured["auto_open"] is False
+
+
+def test_serve_uses_configured_auth_token_without_printing_it(monkeypatch, capsys):
+    captured = {}
+    monkeypatch.setenv("DEVUI_AUTH_TOKEN", "configured-token")
+    monkeypatch.setattr("mad.devui.build_workflow", lambda: "workflow")
+    monkeypatch.setattr("agent_framework_devui.serve", lambda **kwargs: captured.update(kwargs))
+
+    serve()
+
+    assert capsys.readouterr().err == ""
+    assert captured["auth_token"] == "configured-token"
 
 
 class FakeAdapter:
