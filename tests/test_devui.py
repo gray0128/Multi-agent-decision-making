@@ -76,6 +76,9 @@ def test_devui_boundary_models_publish_collection_schemas():
     assert checkpoint_properties["participants"]["type"] == "array"
     assert checkpoint_properties["disputes"]["type"] == "array"
 
+    assert "required" not in generate_input_schema(DevUiPlanResponse)
+    assert "required" not in generate_input_schema(DevUiCheckpointResponse)
+
 
 class FakeAdapter:
     calls: list[tuple[str, str]] = []
@@ -130,8 +133,6 @@ def response_for(request_event, *, action="continue", guidance=""):
     request = request_event.data
     assert isinstance(request, DevUiCheckpointRequest)
     return DevUiCheckpointResponse(
-        deliberation_id=request.deliberation_id,
-        interrupt_id=request.interrupt_id,
         action=action,
         guidance=guidance,
     )
@@ -143,8 +144,6 @@ async def start_confirmed(workflow, request, *, participants=None, report_agent_
     plan = event.data
     assert isinstance(plan, DevUiPlanRequest)
     response = DevUiPlanResponse(
-        deliberation_id=plan.deliberation_id,
-        interrupt_id=plan.interrupt_id,
         participants=participants or [],
         report_agent_id=report_agent_id,
     )
@@ -224,6 +223,20 @@ async def test_automatic_devui_run_has_no_normal_checkpoints(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_devui_accepts_untouched_plan_confirmation_form(tmp_path: Path):
+    workflow = make_workflow(tmp_path)
+    result = await workflow.run(
+        DevUiRequest("问题", agents=["a", "b"], report_agent="a", interactive=False, convergence="never")
+    )
+    request = only_request(result)
+
+    result = await workflow.run(responses={request.request_id: {}})
+
+    assert result.get_request_info_events() == []
+    assert result.get_outputs() == ["# 最终报告\n\n完成。"]
+
+
+@pytest.mark.asyncio
 async def test_devui_deduplicates_initial_agent_selection(tmp_path: Path):
     workflow = make_workflow(tmp_path)
 
@@ -235,31 +248,15 @@ async def test_devui_deduplicates_initial_agent_selection(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-async def test_wrong_response_ids_are_rejected_without_advancing(tmp_path: Path):
+async def test_invalid_checkpoint_action_is_rejected_without_advancing(tmp_path: Path):
     workflow = make_workflow(tmp_path)
     result, _plan = await start_confirmed(
         workflow, DevUiRequest("问题", agents=["a", "b"], report_agent="a")
     )
     first = only_request(result)
-    wrong = response_for(first)
-    wrong.deliberation_id = "wrong-id"
-    result = await workflow.run(responses={first.request_id: wrong})
-    repeated = only_request(result)
-    assert repeated.request_id != first.request_id
-    assert repeated.data.stage == "独立陈述"
-    assert any(event.type == "warning" and "审议 ID 不匹配" in event.data for event in result)
-
-    wrong_interrupt = response_for(repeated)
-    wrong_interrupt.interrupt_id = "wrong-interrupt"
-    result = await workflow.run(responses={repeated.request_id: wrong_interrupt})
-    repeated_again = only_request(result)
-    assert repeated_again.request_id not in {first.request_id, repeated.request_id}
-    assert repeated_again.data.stage == "独立陈述"
-    assert any(event.type == "warning" and "中断 ID 不匹配" in event.data for event in result)
-
-    invalid_action = response_for(repeated_again)
+    invalid_action = response_for(first)
     invalid_action.action = "invalid"
-    result = await workflow.run(responses={repeated_again.request_id: invalid_action})
+    result = await workflow.run(responses={first.request_id: invalid_action})
     final_retry = only_request(result)
     assert final_retry.data.stage == "独立陈述"
     assert any(event.type == "warning" and "不支持动作" in event.data for event in result)
@@ -357,8 +354,6 @@ async def test_devui_user_can_modify_organizer_plan_before_start(tmp_path: Path)
     assert event.data.plan["source"] == "organizer"
     assert all(set(item) == {"id", "name", "role"} for item in event.data.available_agents)
     response = DevUiPlanResponse(
-        event.data.deliberation_id,
-        event.data.interrupt_id,
         participants=[{"id": "a", "role": "反方"}, {"id": "b", "role": "报告人"}],
         report_agent_id="b",
     )
@@ -379,8 +374,6 @@ async def test_devui_rejects_unknown_agent_in_plan_confirmation(tmp_path: Path):
     result = await workflow.run(DevUiRequest("问题", agents=["a", "b"], report_agent="a"))
     event = only_request(result)
     response = DevUiPlanResponse(
-        event.data.deliberation_id,
-        event.data.interrupt_id,
         participants=[{"id": "a"}, {"id": "unknown"}],
         report_agent_id="a",
     )
@@ -392,8 +385,6 @@ async def test_devui_rejects_unknown_agent_in_plan_confirmation(tmp_path: Path):
     await workflow.run(
         responses={
             replacement.request_id: DevUiPlanResponse(
-                replacement.data.deliberation_id,
-                replacement.data.interrupt_id,
                 action="cancel",
             )
         }

@@ -49,8 +49,6 @@ class DevUiPlanRequest(_DevUiSchemaModel):
 
 @dataclass
 class DevUiPlanResponse(_DevUiSchemaModel):
-    deliberation_id: str
-    interrupt_id: str
     action: str = "confirm"
     participants: list[dict[str, str]] = field(default_factory=list)
     report_agent_id: str = ""
@@ -70,8 +68,6 @@ class DevUiCheckpointRequest(_DevUiSchemaModel):
 
 @dataclass
 class DevUiCheckpointResponse(_DevUiSchemaModel):
-    deliberation_id: str
-    interrupt_id: str
     action: str = "continue"
     guidance: str = ""
 
@@ -211,10 +207,6 @@ class _LiveSession:
             return "原始中断 ID 与当前检查点不匹配"
         if workflow_request_id != pending.interrupt_id:
             return "Workflow request ID 与当前中断 ID 不匹配"
-        if response.deliberation_id != self.deliberation_id:
-            return "响应的审议 ID 不匹配"
-        if response.interrupt_id != pending.interrupt_id:
-            return "响应的中断 ID 不匹配"
         if response.action not in pending.actions:
             return f"当前检查点不支持动作：{response.action}"
         if response.action == "guidance" and not response.guidance.strip():
@@ -368,10 +360,6 @@ class DeliberationExecutor(Executor):
         current = pending.plan_request
         if original.interrupt_id != current.interrupt_id or workflow_request_id != current.interrupt_id:
             return "方案确认中断 ID 不匹配"
-        if response.deliberation_id != original.deliberation_id:
-            return "方案确认响应的审议 ID 不匹配"
-        if response.interrupt_id != current.interrupt_id:
-            return "方案确认响应的中断 ID 不匹配"
         if response.action not in {"confirm", "cancel"}:
             return f"方案确认不支持动作：{response.action}"
         return None
