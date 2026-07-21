@@ -1,0 +1,32 @@
+{
+  "name": "multi-agent-decision",
+  "version": "0.2.0-dev.0",
+  "description": "Local, auditable multi-agent deliberation orchestrator",
+  "type": "module",
+  "bin": {
+    "mad": "./dist/cli/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "postbuild": "chmod 755 dist/cli/index.js",
+    "dev": "tsx src/cli/index.ts",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@iarna/toml": "^2.2.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}
