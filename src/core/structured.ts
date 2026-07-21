@@ -1,10 +1,11 @@
 import type { ArchiveStore } from "../archive/store.js";
 import type { CliRegistry } from "../adapters/config.js";
 import { MadError } from "./errors.js";
-import { InvocationRunner } from "./execution.js";
+import { InvocationRunner, settleAllOrThrow } from "./execution.js";
 import { OutcomePipeline } from "./outcome.js";
 import { SharedContextManager } from "./context.js";
 import type { DeliberationAgent, DeliberationPlan } from "./types.js";
+import { createAdapter } from "../adapters/index.js";
 
 export type StructuredCheckpointStage = "independent" | "challenge" | "disputes" | "draft";
 export interface CheckpointDecision {
@@ -73,7 +74,9 @@ export class StructuredController {
     runner?: InvocationRunner,
     signal?: AbortSignal,
   ) {
-    this.runner = runner ?? new InvocationRunner(registry, archive, plan.limits.maxCalls, cwd);
+    this.runner = runner ?? new InvocationRunner(
+      registry, archive, plan.limits.maxCalls, cwd, createAdapter, undefined, plan.limits.globalConcurrency ?? 6,
+    );
     this.runner.setSignal(signal);
     this.runner.setTimeoutSeconds(plan.limits.timeoutSeconds);
     this.context = new SharedContextManager(registry, this.runner, plan);
@@ -100,7 +103,7 @@ export class StructuredController {
 
       const challengeContext = await this.context.snapshot(question);
       const revisions = new Map<string, Revision>();
-      await Promise.all(this.plan.participants.map(async (agent) => {
+      await settleAllOrThrow(this.plan.participants.map(async (agent) => {
         const output = await this.runner.run({
           id: `structured:revision:${agent.id}`,
           kind: "contribution",
@@ -133,10 +136,10 @@ export class StructuredController {
         [`争议收敛 · ${agent.id}`, convergence.get(agent.id)!] as const));
 
       const evidence = await this.context.snapshot(question);
-      const report = await new OutcomePipeline(this.runner, this.plan).run(
+      const report = await new OutcomePipeline(this.runner, this.plan, this.context).run(
         question,
         evidence,
-        this.guidanceText(),
+        () => this.guidanceText(),
         (draft) => this.pauseAt("draft", draft),
       );
       await this.archive.writeReport(report);
@@ -156,7 +159,7 @@ export class StructuredController {
     prompt: (agent: DeliberationAgent) => string,
     kind: "contribution" | "review" = "contribution",
   ): Promise<Map<string, string>> {
-    const values = await Promise.all(agents.map(async (agent) => {
+    const values = await settleAllOrThrow(agents.map(async (agent) => {
       const output = await this.runner.run({
         id: `structured:${stage}:${agent.id}`,
         kind,
@@ -185,11 +188,25 @@ export class StructuredController {
 
   private async pauseAt(stage: StructuredCheckpointStage, summary: string): Promise<void> {
     if (!this.checkpoint) return;
-    await this.archive.setStatus("waiting_checkpoint");
-    const decision = await this.checkpoint(stage, summary);
+    const key = `structured:${stage}`;
+    const remembered = (await this.archive.readState()).checkpointDecisions[key];
+    let decision: CheckpointDecision;
+    if (remembered) {
+      decision = {
+        action: remembered.action as CheckpointDecision["action"],
+        ...(remembered.guidance ? { guidance: remembered.guidance } : {}),
+      };
+    } else {
+      await this.archive.setStatus("waiting_checkpoint");
+      decision = await this.checkpoint(stage, summary);
+      await this.archive.recordCheckpointDecision(key, decision);
+    }
     if (decision.guidance?.trim()) {
-      this.guidance.push(decision.guidance.trim());
-      await this.archive.addGuidance(decision.guidance);
+      const guidance = decision.guidance.trim();
+      if (!this.guidance.includes(guidance)) {
+        this.guidance.push(guidance);
+        await this.archive.addGuidance(guidance);
+      }
     }
     if (decision.action === "pause") throw new MadError("PAUSED", "审议已暂停");
     if (decision.action === "cancel") throw new MadError("CANCELLED", "审议已取消");

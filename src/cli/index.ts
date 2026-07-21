@@ -24,6 +24,7 @@ import { OrganizerService, parseDeliberationPlan } from "../core/planning.js";
 import { StructuredController, type CheckpointHandler } from "../core/structured.js";
 import { DiscussionController, type DiscussionCheckpoint } from "../core/discussion.js";
 import { sharedOriginWarning } from "../core/outcome.js";
+import { InvocationRunner } from "../core/execution.js";
 import { ActiveDeliberationLock, ArchiveStore } from "../archive/store.js";
 import type {
   DeliberationManifest,
@@ -44,7 +45,7 @@ const HELP = `mad - 本地多 Agent 审议工具（TypeScript 迁移版）
   mad deliberate "问题" [--mode structured|free] [--workspace PATH]
                  [--auto] [--auto-confirm-plan] [--format markdown|json]
                  [--max-participants N] [--max-calls N] [--max-discussion-windows N]
-                 [--timeout-seconds N] [--context-budget N]
+                 [--timeout-seconds N] [--context-budget N] [--global-concurrency N]
   mad resume ID [--format markdown|json]
   mad serve [--port PORT]
   mad --help
@@ -137,8 +138,10 @@ function externalPlan(plan: DeliberationPlan): Record<string, unknown> {
   };
 }
 
-function snapshotRegistry(registry: CliRegistry, plan: DeliberationPlan): InvocationConfigSnapshot[] {
-  const references = [plan.organizer, ...plan.participants.map((participant) => participant.invocation)];
+function snapshotRegistry(registry: CliRegistry, plan?: DeliberationPlan): InvocationConfigSnapshot[] {
+  const references = plan
+    ? [plan.organizer, ...plan.participants.map((participant) => participant.invocation)]
+    : registry.clis.flatMap((cli) => cli.presets.map((preset) => ({ cli: cli.id, preset: preset.id })));
   const unique = new Map(references.map((reference) => [`${reference.cli}/${reference.preset}`, reference]));
   return [...unique.values()].map((reference) => {
     const { cli, preset } = resolveInvocation(registry, reference.cli, reference.preset);
@@ -186,7 +189,9 @@ function registryFromManifest(manifest: DeliberationManifest): CliRegistry | nul
       });
     }
   }
-  return { defaults: { generator: manifest.plan.organizer }, clis: [...clis.values()] };
+  const organizer = manifest.plan?.organizer ?? manifest.planning?.organizer;
+  if (!organizer) throw new MadError("CONFIG", "档案缺少组局器快照");
+  return { defaults: { generator: organizer }, clis: [...clis.values()] };
 }
 
 async function confirmPlan(
@@ -201,10 +206,13 @@ async function confirmPlan(
     readonly cwd: string;
     readonly projectMode: boolean;
     readonly signal?: AbortSignal;
+    readonly initialGeneration?: number;
+    readonly onCandidate?: (plan: DeliberationPlan, generation: number) => Promise<void>;
   },
 ): Promise<DeliberationPlan> {
   const terminal = createInterface({ input: process.stdin, output: process.stderr });
   let plan = initial;
+  let generation = context.initialGeneration ?? 0;
   try {
     while (true) {
       process.stderr.write(`最终审议方案：\n${JSON.stringify(externalPlan(plan), null, 2)}\n`);
@@ -215,13 +223,14 @@ async function confirmPlan(
           ? await terminal.question(prompt, { signal: context.signal })
           : await terminal.question(prompt)).trim();
       } catch (error) {
-        if (context.signal?.aborted) throw new MadError("CANCELLED", "方案确认已取消");
+        if (context.signal?.aborted) throw new MadError("PAUSED", "方案确认已暂停");
         throw error;
       }
       if (!answer) return plan;
       if (answer === "/cancel") throw new MadError("CANCELLED", "已取消审议");
       if (answer.startsWith("/regroup")) {
         const guidance = answer.slice("/regroup".length).trim();
+        generation += 1;
         const regrouped = await organizerService.propose({
           question: context.question,
           mode: context.mode,
@@ -231,8 +240,10 @@ async function confirmPlan(
           ...(guidance ? { guidance } : {}),
           ...(context.signal ? { signal: context.signal } : {}),
           projectMode: context.projectMode,
+          proposalId: `planning:organizer:proposal:${generation}`,
         });
         plan = regrouped.plan;
+        await context.onCandidate?.(plan, generation);
         continue;
       }
       plan = parseDeliberationPlan(answer, {
@@ -242,6 +253,7 @@ async function confirmPlan(
         organizer: context.organizer,
       });
       await organizerService.preflightPlan(plan, context.cwd, context.signal, context.projectMode);
+      await context.onCandidate?.(plan, generation);
     }
   } finally {
     terminal.close();
@@ -250,8 +262,17 @@ async function confirmPlan(
 
 function coordinatedStructuredCheckpoint(mailbox: CheckpointMailbox, archive: ArchiveStore, terminalAvailable: boolean, signal?: AbortSignal): CheckpointHandler {
   return async (stage, summary) => {
+    const key = `structured:${stage}`;
+    const state = await archive.readState();
+    const remembered = state.checkpointDecisions[key];
+    if (remembered) return {
+      action: remembered.action as "continue" | "pause" | "cancel",
+      ...(remembered.guidance ? { guidance: remembered.guidance } : {}),
+    };
+    const pending = { kind: stage, summary, actions: ["continue", "guide", "pause", "cancel"] } as const;
+    const existingId = state.pendingCheckpoint?.key === key ? state.pendingCheckpoint.checkpointId : undefined;
     const response = await mailbox.wait(
-      { kind: stage, summary, actions: ["continue", "guide", "pause", "cancel"] },
+      pending,
       terminalAvailable ? async (signal) => {
         process.stderr.write(`\n检查点 ${stage}：\n${summary}\n`);
         const terminal = createInterface({ input: process.stdin, output: process.stderr });
@@ -265,21 +286,41 @@ function coordinatedStructuredCheckpoint(mailbox: CheckpointMailbox, archive: Ar
         } finally { terminal.close(); }
       } : undefined,
       signal,
-      async (checkpointId) => archive.appendEvent("checkpoint.pending", { kind: stage, checkpointId }),
+      async (checkpointId) => {
+        await archive.setPendingCheckpoint(key, checkpointId, pending);
+        await archive.appendEvent("checkpoint.pending", { kind: stage, checkpointId });
+      },
+      existingId,
+      async (accepted) => archive.recordCheckpointDecision(key, {
+        action: accepted.action === "guide" ? "continue" : accepted.action,
+        ...(accepted.guidance ? { guidance: accepted.guidance } : {}),
+        at: accepted.at,
+      }),
     );
-    await archive.appendEvent("checkpoint.responded", { kind: stage, action: response.action });
-    return {
-      action: response.action === "guide" ? "continue" : response.action as "continue" | "pause" | "cancel",
+    const decision = {
+      action: response.action === "guide" ? "continue" as const : response.action as "continue" | "pause" | "cancel",
       ...(response.guidance ? { guidance: response.guidance } : {}),
     };
+    await archive.recordCheckpointDecision(key, decision);
+    await archive.appendEvent("checkpoint.responded", { kind: stage, action: response.action });
+    return decision;
   };
 }
 
 function coordinatedDiscussionCheckpoint(mailbox: CheckpointMailbox, archive: ArchiveStore, terminalAvailable: boolean, signal?: AbortSignal): DiscussionCheckpoint {
   return async (window, converged, rationale) => {
     const kind = `discussion_window_${window}`;
+    const key = `discussion:${window}`;
+    const state = await archive.readState();
+    const remembered = state.checkpointDecisions[key];
+    if (remembered) return {
+      action: remembered.action as "continue" | "end" | "pause" | "cancel",
+      ...(remembered.guidance ? { guidance: remembered.guidance } : {}),
+    };
+    const pending = { kind, summary: rationale, actions: ["continue", "guide", "end", "pause", "cancel"] } as const;
+    const existingId = state.pendingCheckpoint?.key === key ? state.pendingCheckpoint.checkpointId : undefined;
     const response = await mailbox.wait(
-      { kind, summary: rationale, actions: ["continue", "guide", "end", "pause", "cancel"] },
+      pending,
       terminalAvailable ? async (signal) => {
         process.stderr.write(`\n讨论窗口 ${window}：${rationale}${converged ? "（主持建议结束）" : ""}\n`);
         const terminal = createInterface({ input: process.stdin, output: process.stderr });
@@ -292,13 +333,24 @@ function coordinatedDiscussionCheckpoint(mailbox: CheckpointMailbox, archive: Ar
         } finally { terminal.close(); }
       } : undefined,
       signal,
-      async (checkpointId) => archive.appendEvent("checkpoint.pending", { kind, converged, checkpointId }),
+      async (checkpointId) => {
+        await archive.setPendingCheckpoint(key, checkpointId, pending);
+        await archive.appendEvent("checkpoint.pending", { kind, converged, checkpointId });
+      },
+      existingId,
+      async (accepted) => archive.recordCheckpointDecision(key, {
+        action: accepted.action === "guide" ? "continue" : accepted.action,
+        ...(accepted.guidance ? { guidance: accepted.guidance } : {}),
+        at: accepted.at,
+      }),
     );
-    await archive.appendEvent("checkpoint.responded", { kind, action: response.action });
-    return {
-      action: response.action === "guide" ? "continue" : response.action as "continue" | "end" | "pause" | "cancel",
+    const decision = {
+      action: response.action === "guide" ? "continue" as const : response.action as "continue" | "end" | "pause" | "cancel",
       ...(response.guidance ? { guidance: response.guidance } : {}),
     };
+    await archive.recordCheckpointDecision(key, decision);
+    await archive.appendEvent("checkpoint.responded", { kind, action: response.action });
+    return decision;
   };
 }
 
@@ -319,6 +371,7 @@ async function deliberate(args: readonly string[]): Promise<void> {
       "max-discussion-windows": { type: "string" },
       "timeout-seconds": { type: "string" },
       "context-budget": { type: "string" },
+      "global-concurrency": { type: "string" },
     },
   });
   if (parsed.positionals.length !== 1 || !parsed.positionals[0]?.trim()) {
@@ -377,20 +430,52 @@ async function deliberate(args: readonly string[]): Promise<void> {
   const maxDiscussionWindows = integerOption(parsed.values["max-discussion-windows"]);
   const timeoutSeconds = integerOption(parsed.values["timeout-seconds"]);
   const contextBudget = integerOption(parsed.values["context-budget"]);
+  const globalConcurrency = integerOption(parsed.values["global-concurrency"]);
   const limits = resolveLimits({
     ...(maxParticipants === undefined ? {} : { maxParticipants }),
     ...(maxCalls === undefined ? {} : { maxCalls }),
     ...(maxDiscussionWindows === undefined ? {} : { maxDiscussionWindows }),
     ...(timeoutSeconds === undefined ? {} : { timeoutSeconds }),
     ...(contextBudget === undefined ? {} : { contextBudget }),
+    ...(globalConcurrency === undefined ? {} : { globalConcurrency }),
   });
   const lock = new ActiveDeliberationLock(`${paths.runtime}/active.lock`);
   await lock.acquire(id);
   const interrupt = new AbortController();
   const onInterrupt = (): void => interrupt.abort();
   process.once("SIGINT", onInterrupt);
+  const archive = new ArchiveStore(paths.deliberations, id);
+  let archiveCreated = false;
   try {
-    const organizerService = new OrganizerService(registry);
+    const createdAt = new Date().toISOString();
+    let planning: NonNullable<DeliberationManifest["planning"]> = {
+      organizer,
+      limits,
+      autoConfirmPlan: parsed.values["auto-confirm-plan"],
+      allowRegeneration: interaction === "guided",
+      projectMode: Boolean(workspace),
+      generation: 0,
+    };
+    const baseManifest: DeliberationManifest = {
+      schemaVersion: 1,
+      id,
+      createdAt,
+      question,
+      mode,
+      interaction,
+      registrySnapshot: snapshotRegistry(registry),
+      ...(workspace ? { workspace } : {}),
+      planning,
+    };
+    await archive.create(baseManifest);
+    archiveCreated = true;
+    process.stderr.write(`审议已创建：${archive.path}\n`);
+    const organizerRunner = new InvocationRunner(
+      registry, archive, limits.maxCalls, cwd, createAdapter, undefined, limits.globalConcurrency ?? 6,
+    );
+    organizerRunner.setSignal(interrupt.signal);
+    organizerRunner.setTimeoutSeconds(limits.timeoutSeconds);
+    const organizerService = new OrganizerService(registry, createAdapter, organizerRunner);
     process.stderr.write(`正在组局：${organizer.cli}/${organizer.preset}\n`);
     const proposed = await organizerService.propose({
       question,
@@ -401,34 +486,35 @@ async function deliberate(args: readonly string[]): Promise<void> {
       allowRegeneration: interaction === "guided",
       projectMode: Boolean(workspace),
       signal: interrupt.signal,
+      proposalId: "planning:organizer:proposal:0",
     });
+    planning = { ...planning, candidatePlan: proposed.plan };
+    await archive.writeManifest({ ...baseManifest, planning });
     const plan = interaction === "guided" && !parsed.values["auto-confirm-plan"]
       ? await confirmPlan(proposed.plan, organizerService, {
         registry, question, mode, limits, organizer, cwd, projectMode: Boolean(workspace), signal: interrupt.signal,
+        initialGeneration: planning.generation,
+        onCandidate: async (candidatePlan, generation) => {
+          planning = { ...planning, candidatePlan, generation };
+          await archive.writeManifest({ ...baseManifest, planning });
+        },
       })
       : proposed.plan;
     if (parsed.values["auto-confirm-plan"]) {
       process.stderr.write(`自动接受首次有效审议方案：\n${JSON.stringify(externalPlan(plan), null, 2)}\n`);
     }
-    const archive = new ArchiveStore(paths.deliberations, id);
-    await archive.create({
-      schemaVersion: 1,
-      id,
-      createdAt: new Date().toISOString(),
-      question,
-      mode,
-      interaction,
+    await archive.writeManifest({
+      ...baseManifest,
       plan,
-      registrySnapshot: snapshotRegistry(registry, plan),
-      ...(workspace ? { workspace } : {}),
-      planConfirmation: interaction === "guided" ? "interactive" : "auto-first-valid",
+      planning: { ...planning, candidatePlan: plan },
+      planConfirmation: parsed.values["auto-confirm-plan"] ? "auto-first-valid" : "interactive",
     });
-    process.stderr.write(`审议已创建：${archive.path}\n`);
     await archive.appendEvent("plan.confirmed", { plan: externalPlan(plan), preflighted: proposed.preflightedCombinations });
     const warnings = [
       ...(workspace ? [`参与 CLI 已获完整目录只读授权：${workspace.path}`] : []),
       ...(sharedOriginWarning(plan) ? [sharedOriginWarning(plan)] : []),
     ];
+    for (const warning of warnings) await archive.appendEvent("warning", { message: warning });
     const mailbox = new CheckpointMailbox(paths.runtime, id);
     const result = mode === "structured"
       ? await new StructuredController(
@@ -461,6 +547,7 @@ async function deliberate(args: readonly string[]): Promise<void> {
           max_calls: plan.limits.maxCalls,
           timeout_seconds: plan.limits.timeoutSeconds,
           context_budget: plan.limits.contextBudget,
+          global_concurrency: plan.limits.globalConcurrency ?? 6,
         },
         warnings,
         archive_path: archive.path,
@@ -469,6 +556,16 @@ async function deliberate(args: readonly string[]): Promise<void> {
       process.stdout.write(`${result.report}\n`);
     }
     process.stderr.write(`审议档案：${archive.path}\n`);
+  } catch (error) {
+    if (archiveCreated) {
+      const state = await archive.readState();
+      if (state.status === "planning") {
+        if (error instanceof MadError && error.code === "CANCELLED") await archive.setStatus("cancelled");
+        else if (error instanceof MadError && error.code === "PAUSED") await archive.setStatus("paused");
+        else await archive.setStatus("failed");
+      }
+    }
+    throw error;
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     await lock.release();
@@ -489,37 +586,102 @@ async function resume(args: readonly string[]): Promise<void> {
   const id = parsed.positionals[0];
   const paths = appPaths();
   const archive = new ArchiveStore(paths.deliberations, id);
-  const manifest = await archive.readManifest();
-  const registry = registryFromManifest(manifest) ?? await loadCliRegistry(paths.config);
-  const state = await archive.readState();
-  if (state.status === "completed" || state.status === "cancelled") {
-    throw new MadError("USAGE", `审议 ${id} 已处于不可恢复终态：${state.status}`);
-  }
-  const terminalAvailable = Boolean(process.stdin.isTTY && process.stderr.isTTY);
-  const observerAvailable = await observerIsOnline(paths.runtime);
-  if (manifest.interaction === "guided" && !terminalAvailable && !observerAvailable) {
-    throw new MadError("USAGE", "恢复 guided 审议需要交互终端或在线观察服务");
-  }
-  const cwd = manifest.workspace?.path ?? join(paths.runtime, "scratch", id);
-  if (!manifest.workspace) await ensurePrivateDirectory(cwd);
-  if (manifest.workspace) {
-    const canonical = await realpath(cwd);
-    if (canonical !== cwd || !(await stat(canonical)).isDirectory()) throw new MadError("USAGE", `原工作目录不可用：${cwd}`);
-    process.stderr.write(`警告：恢复后将继续直接只读访问完整工作目录：${cwd}\n`);
-  }
-  await new OrganizerService(registry).preflightPlan(manifest.plan, cwd, undefined, Boolean(manifest.workspace));
   const lock = new ActiveDeliberationLock(`${paths.runtime}/active.lock`);
   await lock.acquire(id);
   const interrupt = new AbortController();
   const onInterrupt = (): void => interrupt.abort();
   process.once("SIGINT", onInterrupt);
   try {
+    let manifest = await archive.readManifest();
+    const registry = registryFromManifest(manifest) ?? await loadCliRegistry(paths.config);
+    const state = await archive.readState();
+    if (state.status === "completed" || state.status === "cancelled") {
+      throw new MadError("USAGE", `审议 ${id} 已处于不可恢复终态：${state.status}`);
+    }
+    const terminalAvailable = Boolean(process.stdin.isTTY && process.stderr.isTTY);
+    const observerAvailable = await observerIsOnline(paths.runtime);
+    if (manifest.interaction === "guided" && !terminalAvailable && !observerAvailable) {
+      throw new MadError("USAGE", "恢复 guided 审议需要交互终端或在线观察服务");
+    }
+    const cwd = manifest.workspace?.path ?? join(paths.runtime, "scratch", id);
+    if (!manifest.workspace) await ensurePrivateDirectory(cwd);
+    if (manifest.workspace) {
+      const canonical = await realpath(cwd);
+      if (canonical !== cwd || !(await stat(canonical)).isDirectory()) throw new MadError("USAGE", `原工作目录不可用：${cwd}`);
+      process.stderr.write(`警告：恢复后将继续直接只读访问完整工作目录：${cwd}\n`);
+    }
+    let plan = manifest.plan;
+    if (!plan) {
+      const planning = manifest.planning;
+      if (!planning) throw new MadError("EXECUTION", `审议 ${id} 缺少可恢复的组局状态`);
+      if (!planning.autoConfirmPlan && !terminalAvailable) {
+        throw new MadError("USAGE", "恢复方案确认需要交互终端");
+      }
+      await archive.setStatus("planning");
+      const organizerRunner = new InvocationRunner(
+        registry, archive, planning.limits.maxCalls, cwd, createAdapter, undefined, planning.limits.globalConcurrency ?? 6,
+      );
+      organizerRunner.setSignal(interrupt.signal);
+      organizerRunner.setTimeoutSeconds(planning.limits.timeoutSeconds);
+      const organizerService = new OrganizerService(registry, createAdapter, organizerRunner);
+      let generation = planning.generation;
+      let candidate = planning.candidatePlan;
+      if (!candidate) {
+        const proposed = await organizerService.propose({
+          question: manifest.question,
+          mode: manifest.mode,
+          limits: planning.limits,
+          organizer: planning.organizer,
+          cwd,
+          allowRegeneration: planning.allowRegeneration,
+          projectMode: planning.projectMode,
+          signal: interrupt.signal,
+          proposalId: `planning:organizer:proposal:${generation}`,
+        });
+        candidate = proposed.plan;
+        manifest = { ...manifest, planning: { ...planning, candidatePlan: candidate, generation } };
+        await archive.writeManifest(manifest);
+      } else {
+        await organizerService.preflightPlan(candidate, cwd, interrupt.signal, planning.projectMode);
+      }
+      plan = manifest.interaction === "guided" && !planning.autoConfirmPlan
+        ? await confirmPlan(candidate, organizerService, {
+          registry,
+          question: manifest.question,
+          mode: manifest.mode,
+          limits: planning.limits,
+          organizer: planning.organizer,
+          cwd,
+          projectMode: planning.projectMode,
+          signal: interrupt.signal,
+          initialGeneration: generation,
+          onCandidate: async (candidatePlan, nextGeneration) => {
+            generation = nextGeneration;
+            manifest = {
+              ...manifest,
+              planning: { ...planning, candidatePlan, generation: nextGeneration },
+            };
+            await archive.writeManifest(manifest);
+          },
+        })
+        : candidate;
+      manifest = {
+        ...manifest,
+        plan,
+        planning: { ...planning, candidatePlan: plan, generation },
+        planConfirmation: planning.autoConfirmPlan ? "auto-first-valid" : "interactive",
+      };
+      await archive.writeManifest(manifest);
+      await archive.appendEvent("plan.confirmed", { plan: externalPlan(plan), resumedPlanning: true });
+    } else {
+      await new OrganizerService(registry).preflightPlan(plan, cwd, interrupt.signal, Boolean(manifest.workspace));
+    }
     const mailbox = new CheckpointMailbox(paths.runtime, id);
     const result = manifest.mode === "structured"
       ? await new StructuredController(
         registry,
         archive,
-        manifest.plan,
+        plan,
         cwd,
         manifest.interaction === "guided" ? coordinatedStructuredCheckpoint(mailbox, archive, terminalAvailable, interrupt.signal) : undefined,
         undefined,
@@ -528,7 +690,7 @@ async function resume(args: readonly string[]): Promise<void> {
       : await new DiscussionController(
         registry,
         archive,
-        manifest.plan,
+        plan,
         cwd,
         manifest.interaction === "guided" ? coordinatedDiscussionCheckpoint(mailbox, archive, terminalAvailable, interrupt.signal) : undefined,
         undefined,
@@ -536,26 +698,36 @@ async function resume(args: readonly string[]): Promise<void> {
       ).run(manifest.question);
     const warnings = [
       ...(manifest.workspace ? [`参与 CLI 已获完整目录只读授权：${manifest.workspace.path}`] : []),
-      ...(sharedOriginWarning(manifest.plan) ? [sharedOriginWarning(manifest.plan)] : []),
+      ...(sharedOriginWarning(plan) ? [sharedOriginWarning(plan)] : []),
     ];
+    for (const warning of warnings) await archive.appendEvent("warning", { message: warning });
     if (parsed.values.format === "json") {
       process.stdout.write(`${JSON.stringify({
         deliberation_id: id,
         status: "completed",
         mode: manifest.mode,
         report: result.report,
-        participants: manifest.plan.participants,
+        participants: plan.participants,
         budget_usage: {
           call_attempts: result.callAttempts,
-          max_calls: manifest.plan.limits.maxCalls,
-          timeout_seconds: manifest.plan.limits.timeoutSeconds,
-          context_budget: manifest.plan.limits.contextBudget,
+          max_calls: plan.limits.maxCalls,
+          timeout_seconds: plan.limits.timeoutSeconds,
+          context_budget: plan.limits.contextBudget,
+          global_concurrency: plan.limits.globalConcurrency ?? 6,
         },
         warnings,
         archive_path: archive.path,
       })}\n`);
     } else process.stdout.write(`${result.report}\n`);
     process.stderr.write(`审议档案：${archive.path}\n`);
+  } catch (error) {
+    const current = await archive.readState();
+    if (current.status === "planning") {
+      if (error instanceof MadError && error.code === "CANCELLED") await archive.setStatus("cancelled");
+      else if (error instanceof MadError && error.code === "PAUSED") await archive.setStatus("paused");
+      else await archive.setStatus("failed");
+    }
+    throw error;
   } finally {
     process.removeListener("SIGINT", onInterrupt);
     await lock.release();

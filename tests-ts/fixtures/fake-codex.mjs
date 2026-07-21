@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
+if (process.env.FAKE_CODEX_CWD_LOG) writeFileSync(process.env.FAKE_CODEX_CWD_LOG, process.cwd());
+
 if (process.argv.includes("--version")) {
   process.stdout.write("fake-codex 1.0\n");
   process.exit(0);
@@ -8,6 +10,12 @@ if (process.argv.includes("--version")) {
 
 let prompt = "";
 for await (const chunk of process.stdin) prompt += chunk;
+
+const invocationCounter = process.env.FAKE_CODEX_INVOCATION_COUNTER;
+if (invocationCounter) {
+  const count = existsSync(invocationCounter) ? Number(readFileSync(invocationCounter, "utf8")) : 0;
+  writeFileSync(invocationCounter, String(count + 1));
+}
 
 const failureCounter = process.env.FAKE_CODEX_FAILURE_COUNTER;
 if (failureCounter && prompt.includes("独立提出判断")) {
@@ -21,6 +29,10 @@ if (failureCounter && prompt.includes("独立提出判断")) {
 const delayMilliseconds = Number(process.env.FAKE_CODEX_DELAY_MS ?? "0");
 if (delayMilliseconds > 0 && prompt.includes("独立提出判断")) {
   await new Promise((resolve) => setTimeout(resolve, delayMilliseconds));
+}
+const planningDelayMilliseconds = Number(process.env.FAKE_CODEX_PLANNING_DELAY_MS ?? "0");
+if (planningDelayMilliseconds > 0 && prompt.includes("一次性组局 Agent")) {
+  await new Promise((resolve) => setTimeout(resolve, planningDelayMilliseconds));
 }
 
 let output = "阶段输出";

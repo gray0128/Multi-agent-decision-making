@@ -29,6 +29,61 @@ const plan: DeliberationPlan = {
 };
 
 describe("DiscussionController", () => {
+  it("lets a guided user continue after the moderator reports convergence", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-discussion-override-"));
+    const archive = new ArchiveStore(root, "d1");
+    await archive.create({
+      schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "继续讨论",
+      mode: "free", interaction: "guided", plan, planConfirmation: "interactive",
+    });
+    let evaluations = 0;
+    const adapter: CliAdapter = {
+      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      invoke: vi.fn(async ({ prompt }) => {
+        let text = "参与者发言";
+        if (prompt.includes("规划覆盖周期")) text = JSON.stringify({ order: ["host", "critic"] });
+        else if (prompt.includes("评估是否已充分收敛")) {
+          evaluations += 1;
+          text = evaluations === 1
+            ? JSON.stringify({ speakers: ["host", "critic"], converged: true, rationale: "主持建议结束" })
+            : JSON.stringify({ speakers: [], converged: true, rationale: "用户要求的补充已完成" });
+        } else if (prompt.includes("生成 Markdown 草稿")) text = "# 草稿";
+        else if (prompt.includes("完成一次最终修订")) text = "# 最终报告\n## 共识\n完成。\n## 未决争议\n无。\n## 假设\n有效。\n## 风险\n低。";
+        return { text, durationMs: 1, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } };
+      }),
+    };
+    const checkpoint = vi.fn(async (window: number) => ({ action: window === 0 ? "continue" as const : "end" as const }));
+    const runner = new InvocationRunner(registry, archive, plan.limits.maxCalls, process.cwd(), () => adapter);
+    const result = await new DiscussionController(registry, archive, plan, process.cwd(), checkpoint, runner).run("继续讨论");
+    expect(result.rounds).toBe(4);
+    expect(checkpoint).toHaveBeenCalledTimes(2);
+  });
+
+  it("offers a guided checkpoint after the final allowed discussion window", async () => {
+    const oneWindowPlan: DeliberationPlan = { ...plan, limits: { ...plan.limits, maxDiscussionWindows: 1 } };
+    const root = await mkdtemp(join(tmpdir(), "mad-discussion-final-boundary-"));
+    const archive = new ArchiveStore(root, "d1");
+    await archive.create({
+      schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "窗口上限",
+      mode: "free", interaction: "guided", plan: oneWindowPlan, planConfirmation: "interactive",
+    });
+    const adapter: CliAdapter = {
+      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      invoke: vi.fn(async ({ prompt }) => {
+        let text = "参与者发言";
+        if (prompt.includes("规划覆盖周期")) text = JSON.stringify({ order: ["host", "critic"] });
+        else if (prompt.includes("评估是否已充分收敛")) text = JSON.stringify({ speakers: ["host", "critic"], converged: false, rationale: "仍有分歧" });
+        else if (prompt.includes("生成 Markdown 草稿")) text = "# 草稿";
+        else if (prompt.includes("完成一次最终修订")) text = "# 最终报告\n## 共识\n部分。\n## 未决争议\n仍有。\n## 假设\n有效。\n## 风险\n中。";
+        return { text, durationMs: 1, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } };
+      }),
+    };
+    const checkpoint = vi.fn(async (window: number) => ({ action: window === 0 ? "continue" as const : "end" as const }));
+    const runner = new InvocationRunner(registry, archive, oneWindowPlan.limits.maxCalls, process.cwd(), () => adapter);
+    await new DiscussionController(registry, archive, oneWindowPlan, process.cwd(), checkpoint, runner).run("窗口上限");
+    expect(checkpoint).toHaveBeenCalledTimes(2);
+  });
+
   it("runs coverage, non-consecutive windows, convergence, and the shared outcome pipeline", async () => {
     const root = await mkdtemp(join(tmpdir(), "mad-discussion-"));
     const archive = new ArchiveStore(root, "d1");

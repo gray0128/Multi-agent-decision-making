@@ -1,10 +1,11 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { appPaths } from "../src/core/paths.js";
 import { startObserverServer } from "../src/server/observer.js";
+import { ActiveDeliberationLock } from "../src/archive/store.js";
 
 const root = resolve(import.meta.dirname, "..");
 const cli = join(root, "src", "cli", "index.ts");
@@ -49,6 +50,7 @@ describe("mad CLI end to end", () => {
     await configure(home);
     const result = await command(home, [
       "deliberate", "验证新架构", "--mode", mode, "--auto", "--auto-confirm-plan", "--format", "json",
+      "--global-concurrency", "2",
     ]);
     expect(result.code, result.stderr).toBe(0);
     const machine = JSON.parse(result.stdout) as {
@@ -57,16 +59,28 @@ describe("mad CLI end to end", () => {
       report: string;
       archive_path: string;
       warnings: string[];
-      budget_usage: { timeout_seconds: number; context_budget: number };
+      budget_usage: { timeout_seconds: number; context_budget: number; global_concurrency: number };
     };
     expect(machine).toMatchObject({ status: "completed", mode });
     expect(machine.report).toContain("最终共同成果");
     expect(machine.warnings).toEqual([expect.stringContaining("独立模型交叉验证")]);
-    expect(machine.budget_usage).toMatchObject({ timeout_seconds: 10, context_budget: 64_000 });
+    expect(machine.budget_usage).toMatchObject({ timeout_seconds: 10, context_budget: 64_000, global_concurrency: 2 });
     expect(result.stdout.trim().split("\n")).toHaveLength(1);
     expect(result.stderr).toContain("审议档案：");
     expect(await readFile(join(machine.archive_path, "report.md"), "utf8")).toBe(machine.report);
     expect((await readFile(join(machine.archive_path, "state.json"), "utf8"))).toContain('"status": "completed"');
+  }, 20_000);
+
+  it("uses the explicit workspace for probe and every project invocation", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-cli-workspace-"));
+    const workspace = await mkdtemp(join(tmpdir(), "mad-explicit-workspace-"));
+    const cwdLog = join(home, "cwd-log");
+    await configure(home);
+    const result = await command(home, [
+      "deliberate", "检查工作目录", "--workspace", workspace, "--auto", "--auto-confirm-plan", "--format", "json",
+    ], { FAKE_CODEX_CWD_LOG: cwdLog });
+    expect(result.code, result.stderr).toBe(0);
+    expect(await readFile(cwdLog, "utf8")).toBe(await realpath(workspace));
   }, 20_000);
 
   it("resumes only unfinished logical calls after a double invocation failure", async () => {
@@ -90,6 +104,28 @@ describe("mad CLI end to end", () => {
     const machine = JSON.parse(resumed.stdout) as { status: string; report: string };
     expect(machine.status).toBe("completed");
     expect(machine.report).toContain("最终共同成果");
+  }, 20_000);
+
+  it("acquires the global lock before resume preflight invokes a CLI", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-cli-resume-lock-"));
+    await configure(home);
+    const failureCounter = join(home, "failure-counter");
+    const first = await command(home, [
+      "deliberate", "锁前预检", "--auto", "--auto-confirm-plan", "--format", "json",
+    ], { FAKE_CODEX_FAILURE_COUNTER: failureCounter });
+    expect(first.code).toBe(30);
+    const [id] = await readdir(join(home, "deliberations"));
+    const invocationCounter = join(home, "invocation-counter");
+    await writeFile(invocationCounter, "0");
+    const lock = new ActiveDeliberationLock(join(home, "runtime", "active.lock"));
+    await lock.acquire("other-deliberation");
+    try {
+      const resumed = await command(home, ["resume", id!], { FAKE_CODEX_INVOCATION_COUNTER: invocationCounter });
+      expect(resumed.code).toBe(5);
+      expect(await readFile(invocationCounter, "utf8")).toBe("0");
+    } finally {
+      await lock.release();
+    }
   }, 20_000);
 
   it("runs guided checkpoints through the observer service without a TTY", async () => {
@@ -149,7 +185,7 @@ describe("mad CLI end to end", () => {
       "--import", "tsx", cli, "deliberate", "中断恢复", "--auto", "--auto-confirm-plan", "--format", "json",
     ], {
       cwd: root,
-      env: { ...process.env, MAD_HOME: home, FAKE_CODEX_DELAY_MS: "5000" },
+      env: { ...process.env, MAD_HOME: home, FAKE_CODEX_PLANNING_DELAY_MS: "5000" },
       stdio: ["ignore", "pipe", "pipe"],
     });
     const stdout: Buffer[] = [];
@@ -171,6 +207,9 @@ describe("mad CLI end to end", () => {
     expect(Buffer.concat(stdout).toString("utf8")).toBe("");
     const [id] = await readdir(join(home, "deliberations"));
     expect(await readFile(join(home, "deliberations", id!, "state.json"), "utf8")).toContain('"status": "paused"');
+    const planningManifest = JSON.parse(await readFile(join(home, "deliberations", id!, "manifest.json"), "utf8")) as { plan?: unknown; planning?: unknown };
+    expect(planningManifest.plan).toBeUndefined();
+    expect(planningManifest.planning).toBeTruthy();
 
     const resumed = await command(home, ["resume", id!, "--format", "json"]);
     expect(resumed.code, resumed.stderr).toBe(0);

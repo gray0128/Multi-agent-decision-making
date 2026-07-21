@@ -45,6 +45,32 @@ function manifest(id: string): DeliberationManifest {
 }
 
 describe("StructuredController", () => {
+  it("waits for sibling calls to settle before a parallel stage fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-structured-settle-"));
+    const archive = new ArchiveStore(root, "d1");
+    const concurrentRegistry: CliRegistry = {
+      ...registry,
+      clis: [{ ...registry.clis[0]!, maxConcurrency: 2 }],
+    };
+    await archive.create(manifest("d1"));
+    let slowFinished = false;
+    const adapter: CliAdapter = {
+      supportsProjectReadOnly: true,
+      probe: vi.fn(),
+      check: vi.fn(),
+      invoke: vi.fn(async ({ prompt }) => {
+        if (prompt.includes("architect")) throw new Error("fast failure");
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        slowFinished = true;
+        return { text: "slow result", durationMs: 50, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } };
+      }),
+    };
+    const runner = new InvocationRunner(concurrentRegistry, archive, plan.limits.maxCalls, process.cwd(), () => adapter);
+    const controller = new StructuredController(concurrentRegistry, archive, plan, process.cwd(), undefined, runner);
+    await expect(controller.run("迁移方案")).rejects.toThrow(/连续两次失败/);
+    expect(slowFinished).toBe(true);
+  });
+
   it("runs barriers, one convergence round, review, and final revision", async () => {
     const root = await mkdtemp(join(tmpdir(), "mad-structured-"));
     const archive = new ArchiveStore(root, "d1");
@@ -72,18 +98,27 @@ describe("StructuredController", () => {
       }),
     };
     const runner = new InvocationRunner(registry, archive, plan.limits.maxCalls, process.cwd(), () => adapter);
-    const controller = new StructuredController(registry, archive, plan, process.cwd(), undefined, runner);
+    const checkpoint = vi.fn(async (stage: string) => ({
+      action: "continue" as const,
+      ...(stage === "draft" ? { guidance: "最终报告必须列出回滚步骤" } : {}),
+    }));
+    const controller = new StructuredController(registry, archive, plan, process.cwd(), checkpoint, runner);
     const result = await controller.run("迁移方案");
     expect(result.report).toContain("最终报告");
     expect(result.disputes).toEqual(["迁移时机"]);
     expect(result.callAttempts).toBe(11);
     expect(maximumActive).toBe(1); // 同一 CLI 的所有角色和预设共享限流器
     expect(prompts.some((prompt) => prompt.includes("不得把这些角色的一致意见描述为独立模型交叉验证"))).toBe(true);
+    const reviewPrompt = prompts.find((prompt) => prompt.includes("检查是否忠实反映"));
+    expect(reviewPrompt).toContain("独立陈述");
+    const finalPrompt = prompts.find((prompt) => prompt.includes("完成一次最终修订"));
+    expect(finalPrompt).toContain("最终报告必须列出回滚步骤");
     const transcript = (await readFile(join(archive.path, "transcript.jsonl"), "utf8")).trim().split("\n");
     expect(transcript).toHaveLength(11);
 
     const resumed = await controller.run("迁移方案");
     expect(resumed.callAttempts).toBe(11);
     expect(adapter.invoke).toHaveBeenCalledTimes(11);
+    expect(checkpoint).toHaveBeenCalledTimes(4);
   });
 });

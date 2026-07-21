@@ -25,7 +25,7 @@ export interface PreflightResult {
 
 export interface CliAdapter {
   readonly supportsProjectReadOnly: boolean;
-  probe(signal?: AbortSignal): Promise<PreflightResult>;
+  probe(signal?: AbortSignal, cwd?: string): Promise<PreflightResult>;
   check(cwd: string, signal?: AbortSignal): Promise<PreflightResult>;
   invoke(request: InvocationRequest): Promise<AdapterResult>;
 }

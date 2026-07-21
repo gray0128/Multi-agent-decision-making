@@ -7,6 +7,7 @@ export const DEFAULT_LIMITS: ResourceLimits = {
   maxDiscussionWindows: 6,
   timeoutSeconds: 300,
   contextBudget: 128_000,
+  globalConcurrency: 6,
 };
 
 export const SAFE_MAX_LIMITS: ResourceLimits = {
@@ -15,13 +16,14 @@ export const SAFE_MAX_LIMITS: ResourceLimits = {
   maxDiscussionWindows: 12,
   timeoutSeconds: 1_800,
   contextBudget: 1_000_000,
+  globalConcurrency: 16,
 };
 
 export function resolveLimits(overrides: Partial<ResourceLimits> = {}): ResourceLimits {
   const limits = { ...DEFAULT_LIMITS, ...overrides };
   for (const [key, maximum] of Object.entries(SAFE_MAX_LIMITS) as [keyof ResourceLimits, number][]) {
     const value = limits[key];
-    if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1 || value > maximum) {
       throw new MadError("USAGE", `${key} 必须是 1 到 ${maximum} 之间的整数`);
     }
   }

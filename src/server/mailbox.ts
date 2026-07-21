@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
+import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createConnection } from "node:net";
 
@@ -18,6 +18,20 @@ export interface CheckpointResponse {
 
 const delay = (milliseconds: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, milliseconds));
 
+export async function publishExclusiveJson(path: string, value: unknown): Promise<boolean> {
+  const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temporary, `${JSON.stringify(value)}\n`, { flag: "wx", mode: 0o600 });
+  try {
+    await link(temporary, path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  } finally {
+    await unlink(temporary);
+  }
+}
+
 export class CheckpointMailbox {
   private readonly directory: string;
   private readonly requestPath: string;
@@ -34,10 +48,12 @@ export class CheckpointMailbox {
     local?: (signal: AbortSignal) => Promise<{ action: string; guidance?: string }>,
     signal?: AbortSignal,
     onPublished?: (checkpointId: string) => Promise<void>,
+    existingCheckpointId?: string,
+    onAccepted?: (response: CheckpointResponse) => Promise<void>,
   ): Promise<CheckpointResponse> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
-    await this.remove(this.responsePath);
-    const checkpointId = randomUUID();
+    if (!existingCheckpointId) await this.remove(this.responsePath);
+    const checkpointId = existingCheckpointId ?? randomUUID();
     const request = { deliberationId: this.deliberationId, checkpointId, ...pending, createdAt: new Date().toISOString() };
     const temporary = `${this.requestPath}.${process.pid}.${randomUUID()}.tmp`;
     await writeFile(temporary, `${JSON.stringify(request)}\n`, { flag: "wx", mode: 0o600 });
@@ -48,6 +64,7 @@ export class CheckpointMailbox {
     signal?.addEventListener("abort", onExternalAbort, { once: true });
     if (signal?.aborted) onExternalAbort();
     let localError: unknown;
+    let consumed = false;
     const localTask = local?.(abort.signal).then(async (response) => {
       await this.submit(checkpointId, response.action, response.guidance ?? "");
     }).catch((error: unknown) => {
@@ -58,7 +75,11 @@ export class CheckpointMailbox {
         if (localError) throw localError;
         try {
           const response = JSON.parse(await readFile(this.responsePath, "utf8")) as CheckpointResponse;
-          if (response.checkpointId === checkpointId && pending.actions.includes(response.action)) return response;
+          if (response.checkpointId === checkpointId && pending.actions.includes(response.action)) {
+            await onAccepted?.(response);
+            consumed = true;
+            return response;
+          }
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
         }
@@ -68,23 +89,17 @@ export class CheckpointMailbox {
       abort.abort();
       signal?.removeEventListener("abort", onExternalAbort);
       await localTask;
-      await Promise.all([this.remove(this.requestPath), this.remove(this.responsePath)]);
+      if (consumed) await Promise.all([this.remove(this.requestPath), this.remove(this.responsePath)]);
     }
   }
 
   public async submit(checkpointId: string, action: string, guidance = ""): Promise<boolean> {
-    try {
-      await writeFile(this.responsePath, `${JSON.stringify({
-        checkpointId,
-        action,
-        guidance,
-        at: new Date().toISOString(),
-      })}\n`, { flag: "wx", mode: 0o600 });
-      return true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw error;
-    }
+    return publishExclusiveJson(this.responsePath, {
+      checkpointId,
+      action,
+      guidance,
+      at: new Date().toISOString(),
+    });
   }
 
   private async remove(path: string): Promise<void> {

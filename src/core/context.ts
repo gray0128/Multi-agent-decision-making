@@ -3,14 +3,13 @@ import { resolveInvocation } from "../adapters/config.js";
 import { MadError } from "./errors.js";
 import type { InvocationRunner } from "./execution.js";
 import type { DeliberationPlan } from "./types.js";
+import { estimateTokens } from "./tokens.js";
+
+export { estimateTokens } from "./tokens.js";
 
 interface ContextEntry {
   readonly label: string;
   readonly content: string;
-}
-
-export function estimateTokens(text: string): number {
-  return Math.ceil(text.length / 4);
 }
 
 export class SharedContextManager {
@@ -47,28 +46,46 @@ export class SharedContextManager {
 
   public async snapshot(question: string): Promise<string> {
     const current = this.renderCurrent();
-    if (estimateTokens(current) <= Math.floor(this.contextBudget * 0.6)) return current;
+    const targetTokens = Math.max(32, Math.floor(this.contextBudget * 0.45));
+    if (estimateTokens(current) <= targetTokens) return current;
     const reportAgent = this.plan.participants.find((participant) => participant.id === this.plan.reportAgentId);
     if (!reportAgent) throw new MadError("EXECUTION", "报告 Agent 不存在，无法生成统一滚动摘要");
     const through = this.entries.length;
-    const maximumCharacters = Math.max(32, Math.floor(this.contextBudget * 4 * 0.3));
-    const result = await this.runner.run({
-      id: `context:summary:${this.summarizedEntries}:${through}`,
-      kind: "summary",
-      agentId: reportAgent.id,
-      invocation: reportAgent.invocation,
-      stage: "context_summary",
-      prompt: `你是报告 Agent ${reportAgent.id}。为所有参与者生成同一份权威滚动摘要。\n问题：${question}\n` +
-        `保留各参与者身份、关键证据、立场、争议、假设、风险及尚待执行的任务约束；不得把共享调用来源说成独立模型验证。` +
-        `不要加入新判断，不超过 ${maximumCharacters} 个字符。\n待摘要记录：\n${current}`,
-      parse: (text) => {
-        const value = text.trim();
-        if (!value) throw new Error("滚动摘要为空");
-        if (value.length > maximumCharacters) throw new Error(`滚动摘要超过 ${maximumCharacters} 字符`);
-        return value;
-      },
-    });
-    this.summary = result.value;
+    const maximumCharacters = Math.max(32, Math.floor(this.contextBudget * 4 * 0.1));
+    let source = current;
+    for (let round = 0; estimateTokens(source) > targetTokens; round += 1) {
+      if (round >= 12) throw new MadError("EXECUTION", "滚动摘要无法压缩到上下文预算内");
+      const prefix = `你是报告 Agent ${reportAgent.id}。为所有参与者压缩一段权威记录。\n问题：${question}\n` +
+        `保留身份、证据、立场、争议、假设、风险和任务约束；不加入新判断；不得把共享来源说成独立模型验证。` +
+        `输出不超过 ${maximumCharacters} 个字符。\n`;
+      const availableTokens = this.contextBudget - estimateTokens(prefix) - 16;
+      if (availableTokens < 32) throw new MadError("EXECUTION", "问题和摘要指令已经超过上下文预算");
+      const chunkCharacters = availableTokens * 4;
+      const chunks: string[] = [];
+      for (let offset = 0; offset < source.length; offset += chunkCharacters) {
+        chunks.push(source.slice(offset, offset + chunkCharacters));
+      }
+      const partials: string[] = [];
+      for (let index = 0; index < chunks.length; index += 1) {
+        const result = await this.runner.run({
+          id: `context:summary:${this.summarizedEntries}:${through}:r${round}:c${index}`,
+          kind: "summary",
+          agentId: reportAgent.id,
+          invocation: reportAgent.invocation,
+          stage: "context_summary",
+          prompt: `${prefix}片段 ${index + 1}/${chunks.length}：\n${chunks[index]}`,
+          parse: (text) => {
+            const value = text.trim();
+            if (!value) throw new Error("滚动摘要为空");
+            if (value.length > maximumCharacters) throw new Error(`滚动摘要超过 ${maximumCharacters} 字符`);
+            return value;
+          },
+        });
+        partials.push(result.value);
+      }
+      source = partials.map((value, index) => `## 摘要片段 ${index + 1}\n${value}`).join("\n\n");
+    }
+    this.summary = source;
     this.summarizedEntries = through;
     return this.renderCurrent();
   }

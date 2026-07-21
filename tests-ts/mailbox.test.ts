@@ -1,4 +1,4 @@
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -37,5 +37,36 @@ describe("checkpoint mailbox", () => {
     expect(await mailbox.submit(checkpointId, "cancel")).toBe(true);
     expect(await mailbox.submit(checkpointId, "continue")).toBe(false);
     expect((await wait).action).toBe("cancel");
+  });
+
+  it("reuses a pending checkpoint ID and consumes a response left by a crashed waiter", async () => {
+    const runtime = await mkdtemp(join(tmpdir(), "mad-mailbox-resume-"));
+    await mkdir(join(runtime, "checkpoints"));
+    const mailbox = new CheckpointMailbox(runtime, "d3");
+    expect(await mailbox.submit("cp-recovered", "continue", "沿用决定")).toBe(true);
+    const response = await mailbox.wait(
+      { kind: "draft", summary: "草稿", actions: ["continue", "cancel"] },
+      undefined,
+      undefined,
+      undefined,
+      "cp-recovered",
+    );
+    expect(response).toMatchObject({ checkpointId: "cp-recovered", action: "continue", guidance: "沿用决定" });
+  });
+
+  it("keeps request and response files when authoritative decision persistence fails", async () => {
+    const runtime = await mkdtemp(join(tmpdir(), "mad-mailbox-commit-failure-"));
+    const mailbox = new CheckpointMailbox(runtime, "d4");
+    const waiting = mailbox.wait(
+      { kind: "draft", summary: "草稿", actions: ["continue"] },
+      async () => ({ action: "continue" }),
+      undefined,
+      undefined,
+      undefined,
+      async () => { throw new Error("state commit failed"); },
+    );
+    await expect(waiting).rejects.toThrow(/state commit failed/);
+    await expect(readFile(join(runtime, "checkpoints", "d4.request.json"), "utf8")).resolves.toContain("draft");
+    await expect(readFile(join(runtime, "checkpoints", "d4.response.json"), "utf8")).resolves.toContain("continue");
   });
 });

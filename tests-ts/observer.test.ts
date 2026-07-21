@@ -7,8 +7,15 @@ import { appPaths } from "../src/core/paths.js";
 import type { DeliberationManifest } from "../src/core/types.js";
 import { startObserverServer } from "../src/server/observer.js";
 import { observerIsOnline } from "../src/server/mailbox.js";
+import { APP_JS } from "../src/web/index.js";
 
 describe("authenticated observer service", () => {
+  it("renders structured event details instead of dropping them", () => {
+    expect(APP_JS).toContain("durationMs");
+    expect(APP_JS).toContain("logicalCallId");
+    expect(APP_JS).toContain("d.message");
+  });
+
   it("binds locally, protects APIs, and accepts a checkpoint response only once", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-observer-"));
     const paths = appPaths(home);
@@ -33,6 +40,7 @@ describe("authenticated observer service", () => {
       },
     };
     await archive.create(manifest);
+    await mkdir(join(paths.deliberations, "broken"));
     await mkdir(join(paths.runtime, "checkpoints"), { recursive: true });
     await writeFile(join(paths.runtime, "checkpoints", "d1.request.json"), JSON.stringify({
       checkpointId: "cp-1", kind: "independent", summary: "等待确认", actions: ["continue", "cancel"],
@@ -44,6 +52,7 @@ describe("authenticated observer service", () => {
       expect((await fetch(`http://127.0.0.1:${observer.port}/api/deliberations`)).status).toBe(401);
       const authorization = { Authorization: `Bearer ${observer.token}` };
       const list = await fetch(`http://127.0.0.1:${observer.port}/api/deliberations`, { headers: authorization });
+      expect(list.status).toBe(200);
       expect(await list.json()).toMatchObject([{ id: "d1", status: "planning" }]);
       const endpoint = `http://127.0.0.1:${observer.port}/api/checkpoints/d1/respond`;
       const first = await fetch(endpoint, {

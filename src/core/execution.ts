@@ -4,8 +4,9 @@ import { createAdapter } from "../adapters/index.js";
 import type { CliRegistry } from "../adapters/config.js";
 import { resolveInvocation } from "../adapters/config.js";
 import type { ArchiveStore } from "../archive/store.js";
-import { MadError } from "./errors.js";
+import { MadError, RetryableMadError } from "./errors.js";
 import type { FrozenInvocation, InvocationPresetRef, InvocationResult } from "./types.js";
+import { estimateTokens } from "./tokens.js";
 
 class Semaphore {
   private active = 0;
@@ -29,6 +30,13 @@ class Semaphore {
   }
 }
 
+export async function settleAllOrThrow<T>(promises: readonly Promise<T>[]): Promise<T[]> {
+  const settled = await Promise.allSettled(promises);
+  const failure = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+  if (failure) throw failure.reason;
+  return settled.map((result) => (result as PromiseFulfilledResult<T>).value);
+}
+
 export class InvocationScheduler {
   private readonly global: Semaphore;
   private readonly perCli = new Map<string, Semaphore>();
@@ -43,7 +51,7 @@ export class InvocationScheduler {
       local = new Semaphore(cliMaximum);
       this.perCli.set(cliId, local);
     }
-    return this.global.use(() => local.use(operation));
+    return local.use(() => this.global.use(operation));
   }
 }
 
@@ -67,14 +75,18 @@ export interface LogicalInvocationOutput<T> {
 export class InvocationRunner {
   private defaultSignal: AbortSignal | undefined;
   private timeoutSeconds: number | undefined;
+  private readonly scheduler: InvocationScheduler;
   public constructor(
     private readonly registry: CliRegistry,
     private readonly archive: ArchiveStore,
     private readonly maxCalls: number,
     private readonly cwd = process.cwd(),
     private readonly adapterFactory: AdapterFactory = createAdapter,
-    private readonly scheduler = new InvocationScheduler(),
-  ) {}
+    scheduler?: InvocationScheduler,
+    globalMaximum = 6,
+  ) {
+    this.scheduler = scheduler ?? new InvocationScheduler(globalMaximum);
+  }
 
   public setSignal(signal: AbortSignal | undefined): void {
     this.defaultSignal = signal;
@@ -85,6 +97,14 @@ export class InvocationRunner {
   }
 
   public async run<T = string>(call: LogicalInvocation<T>): Promise<LogicalInvocationOutput<T>> {
+    const resolved = resolveInvocation(this.registry, call.invocation.cli, call.invocation.preset);
+    const inputTokens = estimateTokens(call.prompt);
+    if (inputTokens > resolved.preset.contextBudget) {
+      throw new MadError(
+        "EXECUTION",
+        `逻辑调用 ${call.id} 的输入估算为 ${inputTokens} tokens，超过上下文预算 ${resolved.preset.contextBudget}`,
+      );
+    }
     const frozen: FrozenInvocation = {
       logicalCallId: call.id,
       kind: call.kind,
@@ -100,7 +120,6 @@ export class InvocationRunner {
       await this.archive.ensureTranscript(this.transcriptRecord(call, completed));
       return { value: call.parse ? call.parse(completed.text) : completed.text as T, result: completed, newlyCommitted: false };
     }
-    const resolved = resolveInvocation(this.registry, call.invocation.cli, call.invocation.preset);
     const adapter = this.adapterFactory(resolved.cli, resolved.preset);
     let lastError: unknown;
     for (let retry = 0; retry < 2; retry += 1) {
@@ -124,7 +143,16 @@ export class InvocationRunner {
             ...(signal ? { signal } : {}),
           }),
         );
-        const value = call.parse ? call.parse(adapterResult.text) : adapterResult.text as T;
+        let value: T;
+        try {
+          value = call.parse ? call.parse(adapterResult.text) : adapterResult.text as T;
+        } catch (error) {
+          throw new RetryableMadError(
+            "EXECUTION",
+            `逻辑调用 ${call.id} 的 schema 输出无效：${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
+        }
         const result: InvocationResult = {
           logicalCallId: call.id,
           text: adapterResult.text,
@@ -146,6 +174,15 @@ export class InvocationRunner {
         }
         return { value, result, newlyCommitted: committed };
       } catch (error) {
+        const authoritative = (await this.archive.readState()).completedInvocations[call.id];
+        if (authoritative) {
+          await this.archive.ensureTranscript(this.transcriptRecord(call, authoritative));
+          return {
+            value: call.parse ? call.parse(authoritative.text) : authoritative.text as T,
+            result: authoritative,
+            newlyCommitted: false,
+          };
+        }
         lastError = error;
         await this.archive.appendDiagnostic({
           attemptId,
@@ -156,6 +193,7 @@ export class InvocationRunner {
           error: error instanceof Error ? error.message : String(error),
         });
         if (error instanceof MadError && (error.code === "PAUSED" || error.code === "CANCELLED")) throw error;
+        if (error instanceof MadError && !(error instanceof RetryableMadError)) throw error;
       }
     }
     throw new MadError("EXECUTION", `逻辑调用 ${call.id} 连续两次失败`, { cause: lastError });

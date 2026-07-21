@@ -1,4 +1,4 @@
-import { MadError } from "../core/errors.js";
+import { isLikelyTransientFailure, MadError, RetryableMadError } from "../core/errors.js";
 import type { CliConfig, InvocationPreset } from "./config.js";
 import { runProcess } from "./process.js";
 import type { AdapterResult, CliAdapter, InvocationRequest, PreflightResult } from "./types.js";
@@ -10,10 +10,10 @@ export class CodexAdapter implements CliAdapter {
     private readonly preset: InvocationPreset,
   ) {}
 
-  public async probe(signal?: AbortSignal): Promise<PreflightResult> {
+  public async probe(signal?: AbortSignal, cwd?: string): Promise<PreflightResult> {
     try {
       const result = await runProcess(this.cli.executable, ["--version"], {
-        cwd: process.cwd(),
+        cwd: cwd ?? process.cwd(),
         timeoutMs: Math.min(this.cli.timeoutSeconds * 1_000, 10_000),
         ...(signal ? { signal } : {}),
       });
@@ -26,7 +26,7 @@ export class CodexAdapter implements CliAdapter {
   }
 
   public async check(cwd: string, signal?: AbortSignal): Promise<PreflightResult> {
-    const probe = await this.probe(signal);
+    const probe = await this.probe(signal, cwd);
     if (!probe.ready) return probe;
     try {
       const result = await this.invoke({
@@ -72,7 +72,9 @@ export class CodexAdapter implements CliAdapter {
       ...(request.signal ? { signal: request.signal } : {}),
     });
     if (result.exitCode !== 0) {
-      throw new MadError("EXECUTION", `Codex 调用失败（退出码 ${result.exitCode}）：${this.redact(result.stderr)}`);
+      const detail = this.redact(result.stderr);
+      const ErrorType = isLikelyTransientFailure(detail) ? RetryableMadError : MadError;
+      throw new ErrorType("EXECUTION", `Codex 调用失败（退出码 ${result.exitCode}）：${detail}`);
     }
     const text = result.stdout.trim();
     if (!text) throw new MadError("EXECUTION", "Codex 调用没有返回最终文本");

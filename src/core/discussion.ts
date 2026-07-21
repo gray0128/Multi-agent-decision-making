@@ -5,6 +5,7 @@ import { InvocationRunner } from "./execution.js";
 import { OutcomePipeline } from "./outcome.js";
 import { SharedContextManager } from "./context.js";
 import type { DeliberationAgent, DeliberationPlan } from "./types.js";
+import { createAdapter } from "../adapters/index.js";
 
 export interface DiscussionDecision {
   readonly action: "continue" | "end" | "pause" | "cancel";
@@ -95,7 +96,9 @@ export class DiscussionController {
     signal?: AbortSignal,
   ) {
     if (!plan.moderatorAgentId) throw new MadError("EXECUTION", "自由讨论方案缺少主持 Agent");
-    this.runner = runner ?? new InvocationRunner(registry, archive, plan.limits.maxCalls, cwd);
+    this.runner = runner ?? new InvocationRunner(
+      registry, archive, plan.limits.maxCalls, cwd, createAdapter, undefined, plan.limits.globalConcurrency ?? 6,
+    );
     this.runner.setSignal(signal);
     this.runner.setTimeoutSeconds(plan.limits.timeoutSeconds);
     this.context = new SharedContextManager(registry, this.runner, plan);
@@ -124,12 +127,13 @@ export class DiscussionController {
       for (const agentId of coverage.value) await this.speak(question, this.agent(agentId), "coverage", speeches);
 
       let moderatorPlan = await this.evaluate(question, moderator, participantIds, speeches, 0);
-      while (windows < this.plan.limits.maxDiscussionWindows) {
+      while (true) {
         const decision = await this.atBoundary(windows, moderatorPlan);
-        if (decision === "end" || moderatorPlan.converged) {
+        if (decision === "end") {
           converged = moderatorPlan.converged;
           break;
         }
+        if (windows >= this.plan.limits.maxDiscussionWindows) break;
         windows += 1;
         for (const agentId of moderatorPlan.speakers) {
           await this.speak(question, this.agent(agentId), `window_${windows}`, speeches);
@@ -139,7 +143,7 @@ export class DiscussionController {
       if (moderatorPlan.converged) converged = true;
       const evidence = `自由讨论权威发言记录（主持调度不作为参与者观点）：\n${await this.context.snapshot(question)}\n\n` +
         `讨论状态：${converged ? "主持判断已收敛" : "达到用户结束或窗口上限，可能仍有未决争议"}`;
-      const report = await new OutcomePipeline(this.runner, this.plan).run(question, evidence, this.guidanceText());
+      const report = await new OutcomePipeline(this.runner, this.plan, this.context).run(question, evidence, () => this.guidanceText());
       await this.archive.writeReport(report);
       await this.archive.setStatus("completed");
       const state = await this.archive.readState();
@@ -192,11 +196,25 @@ export class DiscussionController {
 
   private async atBoundary(window: number, plan: ModeratorPlan): Promise<"continue" | "end"> {
     if (!this.checkpoint) return plan.converged ? "end" : "continue";
-    await this.archive.setStatus("waiting_checkpoint");
-    const decision = await this.checkpoint(window, plan.converged, plan.rationale);
+    const key = `discussion:${window}`;
+    const remembered = (await this.archive.readState()).checkpointDecisions[key];
+    let decision: DiscussionDecision;
+    if (remembered) {
+      decision = {
+        action: remembered.action as DiscussionDecision["action"],
+        ...(remembered.guidance ? { guidance: remembered.guidance } : {}),
+      };
+    } else {
+      await this.archive.setStatus("waiting_checkpoint");
+      decision = await this.checkpoint(window, plan.converged, plan.rationale);
+      await this.archive.recordCheckpointDecision(key, decision);
+    }
     if (decision.guidance?.trim()) {
-      this.guidance.push(decision.guidance.trim());
-      await this.archive.addGuidance(decision.guidance);
+      const guidance = decision.guidance.trim();
+      if (!this.guidance.includes(guidance)) {
+        this.guidance.push(guidance);
+        await this.archive.addGuidance(guidance);
+      }
     }
     if (decision.action === "pause") throw new MadError("PAUSED", "审议已暂停");
     if (decision.action === "cancel") throw new MadError("CANCELLED", "审议已取消");

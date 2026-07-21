@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { MadError } from "../core/errors.js";
+import { MadError, RetryableMadError } from "../core/errors.js";
 
 export interface ProcessResult {
   readonly stdout: string;
@@ -8,10 +8,21 @@ export interface ProcessResult {
   readonly durationMs: number;
 }
 
+export const DEFAULT_MAX_PROCESS_OUTPUT_BYTES = 8 * 1024 * 1024;
+
+export interface RunProcessOptions {
+  readonly cwd: string;
+  readonly input?: string;
+  readonly timeoutMs: number;
+  readonly signal?: AbortSignal;
+  readonly participant?: boolean;
+  readonly maxOutputBytes?: number;
+}
+
 export function runProcess(
   executable: string,
   args: readonly string[],
-  options: { readonly cwd: string; readonly input?: string; readonly timeoutMs: number; readonly signal?: AbortSignal; readonly participant?: boolean },
+  options: RunProcessOptions,
 ): Promise<ProcessResult> {
   return new Promise((resolve, reject) => {
     const started = performance.now();
@@ -27,6 +38,9 @@ export function runProcess(
     let timeout: NodeJS.Timeout | undefined;
     let timedOut = false;
     let aborted = false;
+    let outputExceeded = false;
+    let outputBytes = 0;
+    const maximumOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_PROCESS_OUTPUT_BYTES;
 
     const stop = (): void => {
       const terminate = (signal: NodeJS.Signals): void => {
@@ -45,8 +59,19 @@ export function runProcess(
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
 
-    child.stdout.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    const collect = (target: Buffer[], chunk: Buffer): void => {
+      outputBytes += chunk.length;
+      if (outputBytes > maximumOutputBytes) {
+        if (!outputExceeded) {
+          outputExceeded = true;
+          stop();
+        }
+        return;
+      }
+      target.push(chunk);
+    };
+    child.stdout.on("data", (chunk: Buffer) => collect(stdout, chunk));
+    child.stderr.on("data", (chunk: Buffer) => collect(stderr, chunk));
     child.stdin.on("error", () => { /* close/exit handler reports the authoritative result */ });
     child.once("error", (error) => {
       cleanup();
@@ -55,7 +80,8 @@ export function runProcess(
     child.once("close", (code) => {
       cleanup();
       if (aborted) return reject(new MadError("PAUSED", `${executable} 调用已中止`));
-      if (timedOut) return reject(new MadError("EXECUTION", `${executable} 调用超时`));
+      if (timedOut) return reject(new RetryableMadError("EXECUTION", `${executable} 调用超时`));
+      if (outputExceeded) return reject(new MadError("EXECUTION", `${executable} 输出超过上限 ${maximumOutputBytes} 字节`));
       resolve({
         stdout: Buffer.concat(stdout).toString("utf8"),
         stderr: Buffer.concat(stderr).toString("utf8"),

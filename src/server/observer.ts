@@ -4,6 +4,7 @@ import { chmod, readFile, readdir, writeFile, rename, mkdir, unlink } from "node
 import { join } from "node:path";
 import type { AppPaths } from "../core/paths.js";
 import { APP_JS, INDEX_HTML, STYLES_CSS } from "../web/index.js";
+import { publishExclusiveJson } from "./mailbox.js";
 
 const ID = /^[a-zA-Z0-9_-]{1,80}$/;
 
@@ -100,12 +101,17 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
       if (request.method === "GET" && url.pathname === "/api/deliberations") {
         await mkdir(paths.deliberations, { recursive: true, mode: 0o700 });
         const entries = await readdir(paths.deliberations, { withFileTypes: true });
-        const records = await Promise.all(entries.filter((entry) => entry.isDirectory() && ID.test(entry.name)).map(async (entry) => {
-          const value = await detail(paths, entry.name);
-          const manifest = value.manifest as { id: string; question: string; mode: string; createdAt: string };
-          const state = value.state as { status: string };
-          return { id: manifest.id, question: manifest.question, mode: manifest.mode, createdAt: manifest.createdAt, status: state.status };
+        const loaded = await Promise.all(entries.filter((entry) => entry.isDirectory() && ID.test(entry.name)).map(async (entry) => {
+          try {
+            const value = await detail(paths, entry.name);
+            const manifest = value.manifest as { id: string; question: string; mode: string; createdAt: string };
+            const state = value.state as { status: string };
+            return { id: manifest.id, question: manifest.question, mode: manifest.mode, createdAt: manifest.createdAt, status: state.status };
+          } catch {
+            return null;
+          }
         }));
+        const records = loaded.filter((record): record is NonNullable<typeof record> => record !== null);
         records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         return send(response, 200, JSON.stringify(records), "application/json; charset=utf-8");
       }
@@ -166,12 +172,12 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
           return send(response, 409, "Stale or invalid checkpoint response");
         }
         const responsePath = join(paths.runtime, "checkpoints", `${id}.response.json`);
-        try {
-          await writeFile(responsePath, `${JSON.stringify({ checkpointId: payload.checkpointId, action: payload.action, guidance, at: new Date().toISOString() })}\n`, { flag: "wx", mode: 0o600 });
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") return send(response, 409, "Checkpoint already answered");
-          throw error;
-        }
+        if (!await publishExclusiveJson(responsePath, {
+          checkpointId: payload.checkpointId,
+          action: payload.action,
+          guidance,
+          at: new Date().toISOString(),
+        })) return send(response, 409, "Checkpoint already answered");
         return send(response, 202, JSON.stringify({ accepted: true }), "application/json; charset=utf-8");
       }
       return send(response, 404, "Not found");

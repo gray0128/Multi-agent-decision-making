@@ -1,5 +1,13 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { MadError } from "./errors.js";
+
+export const DELIBERATION_ID_PATTERN = /^[a-zA-Z0-9_-]{1,80}$/;
+
+export function assertDeliberationId(id: string): string {
+  if (!DELIBERATION_ID_PATTERN.test(id)) throw new MadError("USAGE", `无效的审议 ID：${id}`);
+  return id;
+}
 
 export interface AppPaths {
   readonly home: string;

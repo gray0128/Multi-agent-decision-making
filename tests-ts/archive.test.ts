@@ -27,6 +27,11 @@ function manifest(id: string): DeliberationManifest {
 }
 
 describe("transparent archive", () => {
+  it("rejects deliberation IDs that escape the archive root", () => {
+    expect(() => new ArchiveStore("/tmp/mad-archives", "../../outside"))
+      .toThrow(/审议 ID/);
+  });
+
   it("freezes inputs and commits one authoritative result exactly once", async () => {
     const root = await mkdtemp(join(tmpdir(), "mad-archive-"));
     const store = new ArchiveStore(root, "d1");
@@ -66,6 +71,21 @@ describe("transparent archive", () => {
     expect(events).toHaveLength(3);
   });
 
+  it("persists accepted checkpoint decisions across store instances", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-checkpoint-state-"));
+    const store = new ArchiveStore(root, "d1");
+    await store.create(manifest("d1"));
+    await store.setPendingCheckpoint("structured:draft", "cp-1", {
+      kind: "draft", summary: "草稿", actions: ["continue", "cancel"],
+    });
+    await store.recordCheckpointDecision("structured:draft", { action: "continue", guidance: "补充证据" });
+    const recovered = await new ArchiveStore(root, "d1").readState();
+    expect(recovered.pendingCheckpoint).toBeUndefined();
+    expect(recovered.checkpointDecisions["structured:draft"]).toMatchObject({
+      action: "continue", guidance: "补充证据",
+    });
+  });
+
   it("allows only one active deliberation lock", async () => {
     const root = await mkdtemp(join(tmpdir(), "mad-lock-"));
     const path = join(root, "runtime", "active.lock");
@@ -100,5 +120,20 @@ describe("transparent archive", () => {
     await lock.acquire("recovered");
     expect(await readFile(path, "utf8")).toContain('"deliberationId":"recovered"');
     await lock.release();
+  });
+
+  it("does not remove a lock that has been replaced by another owner", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-lock-owner-"));
+    const path = join(root, "runtime", "active.lock");
+    const first = new ActiveDeliberationLock(path);
+    await first.acquire("d1");
+    await writeFile(path, JSON.stringify({
+      deliberationId: "d2",
+      pid: process.pid,
+      ownerId: "replacement-owner",
+      acquiredAt: new Date().toISOString(),
+    }));
+    await first.release();
+    expect(await readFile(path, "utf8")).toContain("replacement-owner");
   });
 });

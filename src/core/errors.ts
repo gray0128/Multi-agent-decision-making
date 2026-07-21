@@ -18,6 +18,12 @@ export class MadError extends Error {
   }
 }
 
+export class RetryableMadError extends MadError {}
+
+export function isLikelyTransientFailure(value: string): boolean {
+  return /(timeout|timed out|temporar|transient|rate.?limit|\b429\b|connection reset|econnreset|unavailable|overloaded|try again)/i.test(value);
+}
+
 export const EXIT_CODES: Readonly<Record<MadErrorCode, number>> = {
   USAGE: 2,
   CONFIG: 3,

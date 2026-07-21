@@ -10,6 +10,7 @@ import type {
   InvocationPresetRef,
   ResourceLimits,
 } from "./types.js";
+import { InvocationScheduler, settleAllOrThrow, type InvocationRunner } from "./execution.js";
 
 type JsonObject = Record<string, unknown>;
 const AGENT_ID = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -112,6 +113,7 @@ export interface OrganizerRequest {
   readonly signal?: AbortSignal;
   readonly allowRegeneration?: boolean;
   readonly projectMode?: boolean;
+  readonly proposalId?: string;
 }
 
 export interface OrganizerResult {
@@ -123,6 +125,7 @@ export class OrganizerService {
   public constructor(
     private readonly registry: CliRegistry,
     private readonly adapterFactory: AdapterFactory = createAdapter,
+    private readonly runner?: InvocationRunner,
   ) {}
 
   public async propose(request: OrganizerRequest): Promise<OrganizerResult> {
@@ -135,34 +138,53 @@ export class OrganizerService {
     await this.requireReady(generatorAdapter, request.cwd, `${organizer.cli}/${organizer.preset}`, request.signal);
     const prompt = this.buildPrompt(request, organizer);
     let plan: DeliberationPlan | undefined;
-    let validationError = "";
-    const maximumAttempts = request.allowRegeneration === false ? 1 : 2;
-    for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
-      const result = await generatorAdapter.invoke({
-        prompt: attempt === 0 ? prompt : `${prompt}\n\n上次输出校验失败：${validationError}\n重新生成完整 JSON。`,
-        cwd: request.cwd,
-        timeoutMs: Math.min(request.limits.timeoutSeconds, generator.cli.timeoutSeconds) * 1_000,
+    if (this.runner) {
+      const result = await this.runner.run({
+        id: request.proposalId ?? "planning:organizer:proposal:0",
+        kind: "organizer",
+        agentId: "organizer",
+        invocation: organizer,
+        prompt,
+        stage: "planning",
         ...(request.signal ? { signal: request.signal } : {}),
-      });
-      try {
-        plan = parseDeliberationPlan(result.text, {
+        parse: (text) => parseDeliberationPlan(text, {
           registry: this.registry,
           mode: request.mode,
           limits: request.limits,
           organizer,
+        }),
+      });
+      plan = result.value;
+    } else {
+      let validationError = "";
+      const maximumAttempts = request.allowRegeneration === false ? 1 : 2;
+      for (let attempt = 0; attempt < maximumAttempts; attempt += 1) {
+        const result = await generatorAdapter.invoke({
+          prompt: attempt === 0 ? prompt : `${prompt}\n\n上次输出校验失败：${validationError}\n重新生成完整 JSON。`,
+          cwd: request.cwd,
+          timeoutMs: Math.min(request.limits.timeoutSeconds, generator.cli.timeoutSeconds) * 1_000,
+          ...(request.signal ? { signal: request.signal } : {}),
         });
-        break;
-      } catch (error) {
-        validationError = error instanceof Error ? error.message : String(error);
+        try {
+          plan = parseDeliberationPlan(result.text, {
+            registry: this.registry,
+            mode: request.mode,
+            limits: request.limits,
+            organizer,
+          });
+          break;
+        } catch (error) {
+          validationError = error instanceof Error ? error.message : String(error);
+        }
       }
+      if (!plan) throw new MadError("EXECUTION", `组局方案校验失败：${validationError}`);
     }
-    if (!plan) throw new MadError("EXECUTION", `组局方案校验失败：${validationError}`);
     const preflightedCombinations = await this.preflightPlan(plan, request.cwd, request.signal, request.projectMode ?? false);
     return { plan, preflightedCombinations };
   }
 
   public async preflightPlan(plan: DeliberationPlan, cwd: string, signal?: AbortSignal, projectMode = false): Promise<string[]> {
-    const combinations = new Map<string, CliAdapter>();
+    const combinations = new Map<string, { adapter: CliAdapter; cliId: string; maximum: number }>();
     for (const participant of plan.participants) {
       const key = `${participant.invocation.cli}/${participant.invocation.preset}`;
       if (!combinations.has(key)) {
@@ -171,12 +193,12 @@ export class OrganizerService {
         if (projectMode && !adapter.supportsProjectReadOnly) {
           throw new MadError("PREFLIGHT", `${key} 未证明支持最低只读约束，禁止项目模式`);
         }
-        combinations.set(key, adapter);
+        combinations.set(key, { adapter, cliId: resolved.cli.id, maximum: resolved.cli.maxConcurrency });
       }
     }
-    await Promise.all(
-      [...combinations].map(([key, adapter]) => this.requireReady(adapter, cwd, key, signal)),
-    );
+    const scheduler = new InvocationScheduler(plan.limits.globalConcurrency ?? 6);
+    await settleAllOrThrow([...combinations].map(([key, value]) =>
+      scheduler.run(value.cliId, value.maximum, () => this.requireReady(value.adapter, cwd, key, signal))));
     return [...combinations.keys()];
   }
 

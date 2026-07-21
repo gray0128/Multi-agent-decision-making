@@ -32,6 +32,7 @@ export interface ResourceLimits {
   readonly maxDiscussionWindows: number;
   readonly timeoutSeconds: number;
   readonly contextBudget: number;
+  readonly globalConcurrency?: number;
 }
 
 export interface DeliberationPlan {
@@ -70,10 +71,19 @@ export interface DeliberationManifest {
   readonly question: string;
   readonly mode: DeliberationMode;
   readonly interaction: InteractionPolicy;
-  readonly plan: DeliberationPlan;
+  readonly plan?: DeliberationPlan;
   readonly registrySnapshot?: readonly InvocationConfigSnapshot[];
   readonly workspace?: WorkspaceAccess;
-  readonly planConfirmation: "interactive" | "auto-first-valid";
+  readonly planConfirmation?: "interactive" | "auto-first-valid";
+  readonly planning?: {
+    readonly organizer: InvocationPresetRef;
+    readonly limits: ResourceLimits;
+    readonly autoConfirmPlan: boolean;
+    readonly allowRegeneration: boolean;
+    readonly projectMode: boolean;
+    readonly generation: number;
+    readonly candidatePlan?: DeliberationPlan;
+  };
 }
 
 export interface FrozenInvocation {

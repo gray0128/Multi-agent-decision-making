@@ -2,6 +2,7 @@ import { appendFile, chmod, mkdir, open, readFile, rename, unlink, writeFile } f
 import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { MadError } from "../core/errors.js";
+import { assertDeliberationId } from "../core/paths.js";
 import type { DeliberationManifest, FrozenInvocation, InvocationResult } from "../core/types.js";
 
 export interface DeliberationState {
@@ -12,6 +13,18 @@ export interface DeliberationState {
   readonly guidance: readonly string[];
   readonly pendingInvocations: Readonly<Record<string, FrozenInvocation>>;
   readonly completedInvocations: Readonly<Record<string, InvocationResult>>;
+  readonly pendingCheckpoint?: {
+    readonly key: string;
+    readonly checkpointId: string;
+    readonly kind: string;
+    readonly summary: string;
+    readonly actions: readonly string[];
+  };
+  readonly checkpointDecisions: Readonly<Record<string, {
+    readonly action: string;
+    readonly guidance: string;
+    readonly at: string;
+  }>>;
 }
 
 export interface ArchiveEvent {
@@ -37,13 +50,13 @@ export class ArchiveStore {
     private readonly root: string,
     public readonly deliberationId: string,
   ) {
+    assertDeliberationId(deliberationId);
     this.path = join(root, deliberationId);
   }
 
   public async create(manifest: DeliberationManifest): Promise<void> {
     await mkdir(this.path, { recursive: false, mode: 0o700 });
-    const { schemaVersion: _schemaVersion, ...manifestValue } = manifest;
-    await atomicJson(join(this.path, "manifest.json"), { schema_version: 1, ...manifestValue });
+    await this.writeManifest(manifest);
     await this.writeState({
       schemaVersion: 1,
       status: "planning",
@@ -52,6 +65,7 @@ export class ArchiveStore {
       guidance: [],
       pendingInvocations: {},
       completedInvocations: {},
+      checkpointDecisions: {},
     });
     await Promise.all(
       ["events.jsonl", "transcript.jsonl", "diagnostics.jsonl"].map((name) =>
@@ -70,7 +84,12 @@ export class ArchiveStore {
       throw new MadError("EXECUTION", `不支持的审议状态：${this.deliberationId}`);
     }
     const { schema_version: _snakeVersion, ...rest } = value as Record<string, unknown>;
-    return { ...rest, schemaVersion: 1 } as unknown as DeliberationState;
+    const state = rest as unknown as DeliberationState;
+    return {
+      ...state,
+      schemaVersion: 1,
+      checkpointDecisions: state.checkpointDecisions ?? {},
+    };
   }
 
   public async writeState(state: DeliberationState): Promise<void> {
@@ -151,6 +170,37 @@ export class ArchiveStore {
     await this.appendEvent("checkpoint.guidance", { guidance: value });
   }
 
+  public async setPendingCheckpoint(
+    key: string,
+    checkpointId: string,
+    pending: { readonly kind: string; readonly summary: string; readonly actions: readonly string[] },
+  ): Promise<void> {
+    await this.mutateState((state) => ({
+      ...state,
+      pendingCheckpoint: { key, checkpointId, ...pending },
+      updatedAt: new Date().toISOString(),
+    }));
+  }
+
+  public async recordCheckpointDecision(
+    key: string,
+    decision: { readonly action: string; readonly guidance?: string; readonly at?: string },
+  ): Promise<void> {
+    const guidance = decision.guidance?.trim() ?? "";
+    await this.mutateState((state) => {
+      const { pendingCheckpoint, ...stateWithoutPending } = state;
+      const base = pendingCheckpoint?.key === key ? stateWithoutPending : state;
+      return {
+        ...base,
+        checkpointDecisions: {
+          ...state.checkpointDecisions,
+          [key]: { action: decision.action, guidance, at: decision.at ?? new Date().toISOString() },
+        },
+        updatedAt: new Date().toISOString(),
+      };
+    });
+  }
+
   public async readManifest(): Promise<DeliberationManifest> {
     const value: unknown = JSON.parse(await readFile(join(this.path, "manifest.json"), "utf8"));
     const version = typeof value === "object" && value !== null
@@ -161,6 +211,11 @@ export class ArchiveStore {
     }
     const { schema_version: _snakeVersion, ...rest } = value as Record<string, unknown>;
     return { ...rest, schemaVersion: 1 } as unknown as DeliberationManifest;
+  }
+
+  public async writeManifest(manifest: DeliberationManifest): Promise<void> {
+    const { schemaVersion: _schemaVersion, ...manifestValue } = manifest;
+    await atomicJson(join(this.path, "manifest.json"), { schema_version: 1, ...manifestValue });
   }
 
   public async ensureTranscript(record: Record<string, unknown> & { readonly logicalCallId: string }): Promise<void> {
@@ -210,6 +265,7 @@ export class ArchiveStore {
 
 export class ActiveDeliberationLock {
   private handle: Awaited<ReturnType<typeof open>> | undefined;
+  private ownerId: string | undefined;
 
   public constructor(private readonly path: string) {}
 
@@ -218,7 +274,13 @@ export class ActiveDeliberationLock {
     for (let attempt = 0; attempt < 2; attempt += 1) {
       try {
         this.handle = await open(this.path, "wx", 0o600);
-        await this.handle.writeFile(`${JSON.stringify({ deliberationId, pid: process.pid, acquiredAt: new Date().toISOString() })}\n`);
+        this.ownerId = randomUUID();
+        await this.handle.writeFile(`${JSON.stringify({
+          deliberationId,
+          pid: process.pid,
+          ownerId: this.ownerId,
+          acquiredAt: new Date().toISOString(),
+        })}\n`);
         return;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0 || !await this.reclaimStale()) {
@@ -232,11 +294,27 @@ export class ActiveDeliberationLock {
     if (!this.handle) return;
     await this.handle.close();
     this.handle = undefined;
-    await unlink(this.path);
+    const ownerId = this.ownerId;
+    this.ownerId = undefined;
+    try {
+      const current = JSON.parse(await readFile(this.path, "utf8")) as { ownerId?: unknown };
+      if (current.ownerId === ownerId) await unlink(this.path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
   }
 
   private async reclaimStale(): Promise<boolean> {
+    const reclaimPath = `${this.path}.reclaim`;
+    let reclaimHandle: Awaited<ReturnType<typeof open>> | undefined;
     try {
+      try {
+        reclaimHandle = await open(reclaimPath, "wx", 0o600);
+        await reclaimHandle.writeFile(`${JSON.stringify({ pid: process.pid, ownerId: randomUUID() })}\n`);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+        throw error;
+      }
       const value = JSON.parse(await readFile(this.path, "utf8")) as { pid?: unknown };
       if (!Number.isSafeInteger(value.pid)) return false;
       try {
@@ -249,6 +327,13 @@ export class ActiveDeliberationLock {
       return true;
     } catch {
       return false;
+    } finally {
+      if (reclaimHandle) {
+        await reclaimHandle.close();
+        try { await unlink(reclaimPath); } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        }
+      }
     }
   }
 }

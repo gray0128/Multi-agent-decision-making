@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { AdapterId, CliConfig, InvocationPreset } from "../src/adapters/config.js";
 import { buildInvocationCommand, buildProbeCommand } from "../src/adapters/generic.js";
 import { publicError, publicText } from "../src/adapters/public-text.js";
+import { runProcess } from "../src/adapters/process.js";
 
 const preset: InvocationPreset = { id: "deep", model: "model-id", contextBudget: 64_000, options: {} };
 function cli(adapter: AdapterId): CliConfig {
@@ -9,6 +10,14 @@ function cli(adapter: AdapterId): CliConfig {
 }
 
 describe("typed CLI adapters", () => {
+  it("terminates a child process whose combined output exceeds the configured limit", async () => {
+    await expect(runProcess(process.execPath, ["-e", "process.stdout.write('x'.repeat(4096))"], {
+      cwd: process.cwd(),
+      timeoutMs: 5_000,
+      maxOutputBytes: 1_024,
+    })).rejects.toThrow(/输出超过上限/);
+  });
+
   it.each([
     ["claude", ["--permission-mode", "plan", "--no-session-persistence"]],
     ["grok", ["--permission-mode", "plan", "--no-subagents", "--no-memory"]],

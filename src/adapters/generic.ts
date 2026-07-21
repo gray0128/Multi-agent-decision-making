@@ -1,4 +1,4 @@
-import { MadError } from "../core/errors.js";
+import { isLikelyTransientFailure, MadError, RetryableMadError } from "../core/errors.js";
 import type { CliConfig, InvocationPreset } from "./config.js";
 import { runProcess } from "./process.js";
 import { publicError, publicText } from "./public-text.js";
@@ -35,10 +35,10 @@ export class GenericCliAdapter implements CliAdapter {
     this.supportsProjectReadOnly = cli.adapter !== "reasonix";
   }
 
-  public async probe(signal?: AbortSignal): Promise<PreflightResult> {
+  public async probe(signal?: AbortSignal, cwd?: string): Promise<PreflightResult> {
     try {
       const result = await runProcess(this.cli.executable, buildProbeCommand(this.cli.adapter), {
-        cwd: process.cwd(), timeoutMs: Math.min(this.cli.timeoutSeconds * 1_000, 10_000), ...(signal ? { signal } : {}),
+        cwd: cwd ?? process.cwd(), timeoutMs: Math.min(this.cli.timeoutSeconds * 1_000, 10_000), ...(signal ? { signal } : {}),
       });
       return result.exitCode === 0
         ? { ready: true, version: (result.stdout || result.stderr).trim() }
@@ -49,7 +49,7 @@ export class GenericCliAdapter implements CliAdapter {
   }
 
   public async check(cwd: string, signal?: AbortSignal): Promise<PreflightResult> {
-    const probe = await this.probe(signal);
+    const probe = await this.probe(signal, cwd);
     if (!probe.ready) return probe;
     try {
       const result = await this.invoke({ prompt: "只回复 READY，不要执行任何工具。", cwd, ...(signal ? { signal } : {}) });
@@ -69,7 +69,11 @@ export class GenericCliAdapter implements CliAdapter {
       participant: true,
       ...(request.signal ? { signal: request.signal } : {}),
     });
-    if (result.exitCode !== 0) throw new MadError("EXECUTION", `${this.cli.id} 调用失败（退出码 ${result.exitCode}）：${this.redact(result.stderr || result.stdout)}`);
+    if (result.exitCode !== 0) {
+      const detail = this.redact(result.stderr || result.stdout);
+      const ErrorType = isLikelyTransientFailure(detail) ? RetryableMadError : MadError;
+      throw new ErrorType("EXECUTION", `${this.cli.id} 调用失败（退出码 ${result.exitCode}）：${detail}`);
+    }
     const reportedError = publicError(result.stdout);
     if (reportedError) throw new MadError("EXECUTION", `${this.cli.id} 调用失败：${this.redact(reportedError)}`);
     const text = publicText(result.stdout);
