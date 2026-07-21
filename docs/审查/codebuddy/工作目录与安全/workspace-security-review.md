@@ -243,3 +243,9 @@
 
 **创建时间**：2026-07-21
 **创建概要**：依据 `docs/TypeScript目标架构.md` 第 15 节，对照 `src/core/paths.ts`、`src/cli/index.ts`、`src/adapters/`、`src/core/planning.ts`、`tests-ts/init-template.test.ts`、`tests-ts/cli-e2e.test.ts` 等实现，逐条核查「工作目录与安全」10 项要求及 3 项风险；结论为全部已实现，无缺失/部分实现/过度实现，未发现需修复项。
+
+---
+
+## 变更记录
+
+- 2026-07-21：按 agent 目录重新整理，本文件归入 `docs/审查/codebuddy/`。

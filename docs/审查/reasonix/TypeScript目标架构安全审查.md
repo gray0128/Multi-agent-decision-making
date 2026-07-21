@@ -2,8 +2,9 @@
 
 > 审查日期：2026-07-21  
 > 审查基线：当前工作区 `HEAD`  
-> 对照规范：[TypeScript CLI 与审议观察页目标架构](../TypeScript目标架构.md)  
-> 审查者：Claude（安全、健壮性与边界条件视角）
+> 对照规范：[TypeScript CLI 与审议观察页目标架构](../../TypeScript目标架构.md)  
+> 审查者：Reasonix 代写「Claude 安全/健壮性视角」（非 claude CLI 独立运行）  
+> 产出目录：`docs/审查/reasonix/`
 
 ## 1. 审查范围
 
@@ -226,3 +227,9 @@ frame-ancestors 'none'; base-uri 'none'
 - **原子操作**：关键文件使用 POSIX 原子写入，确保崩溃安全
 
 主要改进方向是**标准化所有 adapter 的秘密净化**，确保 Generic CLI adapter 的错误输出不会意外泄露凭证到持久化诊断日志中。
+
+---
+
+## 变更记录
+
+- 2026-07-21：按 agent 目录重新整理审查报告；修正相对链接与产出归属说明。

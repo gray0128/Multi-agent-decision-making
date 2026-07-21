@@ -2,7 +2,7 @@
 
 > 审查日期：2026-07-21
 > 审查基线：当前工作区 `HEAD`（`85f97af`）
-> 对照规范：[TypeScript CLI 与审议观察页目标架构](../../TypeScript目标架构.md) 第 4、6 节
+> 对照规范：[TypeScript CLI 与审议观察页目标架构](../../../TypeScript目标架构.md) 第 4、6 节
 > 审查范围：CLI 注册表（`clis.toml`）、适配器 schema、`extra_args` 禁止、调用预设、方案约束、两层验证、`mad init`、失败行为、子命令与七个适配器
 > 审查者：CLI 适配器与注册表视角
 
@@ -286,5 +286,12 @@ if (interaction === "guided" && !terminalAvailable && !parsed.values["auto-confi
 
 ---
 
+---
+
 **变更时间**：2026-07-21
 **变更概要**：创建本审查报告；对 `docs/TypeScript目标架构.md` 第 4 节（CLI 注册表与模型调用预设）与第 6 节（CLI 与交互模式）中与 CLI 适配器、注册表、预设、方案约束、两层验证、`mad init`、失败行为、子命令和七个适配器相关的 10 条要求进行逐条对照，覆盖 `src/adapters/`、`src/cli/index.ts`、`src/core/planning.ts`、`src/core/paths.ts` 及 `tests-ts/config.test.ts`、`tests-ts/planning.test.ts`、`tests-ts/adapters-ts.test.ts`、`tests-ts/init-template.test.ts`，结论为全部已实现，未发现阻塞问题。
+
+## 变更记录
+
+- 2026-07-21：创建本审查报告（见上变更概要）。
+- 2026-07-21：按 agent 目录重新整理，本文件归入 `docs/审查/codebuddy/`；修正相对链接。

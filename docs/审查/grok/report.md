@@ -185,3 +185,4 @@ guided 检查点：`independent` / `challenge` / `disputes` / `draft`。
 ## 变更记录
 
 - 2026-07-21：首次输出。对照 `docs/TypeScript目标架构.md` 审查 `src/` 当前实现；忽略其他审查报告；报告路径 `docs/审查/grok/report.md`。
+- 2026-07-21：按 agent 目录重新整理审查报告（路径未变，补充变更记录）。

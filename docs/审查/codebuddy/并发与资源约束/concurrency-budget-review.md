@@ -203,3 +203,8 @@
 ## 7. 变更记录
 
 - 2026-07-21：创建时间。基于 docs/TypeScript目标架构.md 第 9 节对照 src/core/{limits,execution,context,tokens,paths}.ts 与 tests-ts/{limits,execution,context-manager}.test.ts 完成「并发与资源约束」一致性审查；整体结论已实现，仅列出 4 条轻微风险与 1 条测试覆盖缺口，不要求修改代码。
+---
+
+## 变更记录
+
+- 2026-07-21：按 agent 目录重新整理，本文件归入 `docs/审查/codebuddy/`。

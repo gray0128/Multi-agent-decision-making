@@ -238,3 +238,4 @@
 
 - 创建时间：2026-07-21
 - 创建概要：依据 TypeScript 目标架构文档第 5、7、8 节，对 src/core/structured.ts、src/core/discussion.ts、src/core/planning.ts、src/core/outcome.ts 及其测试文件进行逐项审查，确认组局阶段、结构化审议七阶段、自由讨论控制器与窗口机制、共享报告流水线均与文档一致，未发现缺失或过度实现。
+- 2026-07-21：按 agent 目录重新整理，本文件归入 `docs/审查/codebuddy/`。
