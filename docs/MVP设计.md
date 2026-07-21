@@ -1,5 +1,7 @@
 # 本地多 Agent 审议应用 MVP 设计
 
+> 本文记录当前 Python MVP 的历史设计。已确认但尚待实现的替代架构见 [TypeScript CLI 与审议观察页目标架构](TypeScript目标架构.md)。
+
 ## 目标
 
 构建一个仅在 macOS 本机运行的多 Agent 审议应用。应用通过 Microsoft Agent Framework 编排已经安装和认证的 AI CLI 运行时，使多个 Agent 配置围绕一个问题进行结构化、多阶段交流，最后生成可核查的高质量报告。

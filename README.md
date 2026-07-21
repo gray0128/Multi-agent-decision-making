@@ -1,5 +1,7 @@
 # Multi Agent Decision
 
+> 当前仓库仍运行 Python MVP。已确认但尚待实现的 TypeScript CLI、自由讨论和审议观察页架构见 [TypeScript 目标架构](docs/TypeScript目标架构.md)；迁移完成前，以下安装与使用说明仍以当前 Python 实现为准。
+
 通过 Microsoft Agent Framework 编排本机已安装并完成认证的 AI CLI，围绕一个问题开展结构化、多 Agent、只读审议，并生成可恢复、可审计的共同报告。
 
 本项目目前只正式支持 macOS。DevUI 是仅供本机使用的开发工具，不是生产服务，也不支持远程或公网暴露。

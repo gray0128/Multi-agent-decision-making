@@ -1,5 +1,7 @@
 # MVP 验收记录
 
+> 本文记录 Python MVP 的历史验收结果，不代表 [TypeScript 目标架构](TypeScript目标架构.md) 已经实现。
+
 ## 验收范围
 
 本记录收口 [MVP 后续工作追踪 #8](https://github.com/gray0128/Multi-agent-decision-making/issues/8)。验收基线为安装与集成文档合并后的 `main`，覆盖子 Issue #1 至 #7、MVP 设计中的 12 条验收标准，以及一次真实多 CLI 项目审议。
