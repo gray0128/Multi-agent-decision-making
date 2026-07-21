@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { createConnection } from "node:net";
+import { SERVER_HOST } from "./constants.js";
 
 export interface PendingCheckpoint {
   readonly kind: string;
@@ -113,7 +114,7 @@ export async function observerIsOnline(runtime: string): Promise<boolean> {
     if (!Number.isSafeInteger(value.pid) || !Number.isSafeInteger(value.port)) return false;
     process.kill(value.pid as number, 0);
     return await new Promise<boolean>((resolve) => {
-      const socket = createConnection({ host: "127.0.0.1", port: value.port as number });
+      const socket = createConnection({ host: SERVER_HOST, port: value.port as number });
       let settled = false;
       const finish = (online: boolean): void => {
         if (settled) return;

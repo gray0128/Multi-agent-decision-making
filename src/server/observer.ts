@@ -4,7 +4,10 @@ import { chmod, readFile, readdir, writeFile, rename, mkdir, unlink } from "node
 import { join } from "node:path";
 import type { AppPaths } from "../core/paths.js";
 import { APP_JS, INDEX_HTML, STYLES_CSS } from "../web/index.js";
+import { renderMarkdown } from "../web/markdown.js";
 import { publishExclusiveJson } from "./mailbox.js";
+import { ArchiveStore } from "../archive/store.js";
+import { SERVER_HOST } from "./constants.js";
 
 const ID = /^[a-zA-Z0-9_-]{1,80}$/;
 
@@ -64,10 +67,11 @@ async function checkpoint(paths: AppPaths, id: string): Promise<unknown | null> 
 
 async function detail(paths: AppPaths, id: string): Promise<Record<string, unknown>> {
   const root = join(paths.deliberations, id);
+  const archive = new ArchiveStore(paths.deliberations, id);
   const [manifest, state, events, transcript, pending] = await Promise.all([
-    jsonFile(join(root, "manifest.json")),
-    jsonFile(join(root, "state.json")),
-    jsonLines(join(root, "events.jsonl")),
+    archive.readManifest(),
+    archive.readState(),
+    archive.readEvents(),
     jsonLines(join(root, "transcript.jsonl")),
     checkpoint(paths, id),
   ]);
@@ -75,7 +79,23 @@ async function detail(paths: AppPaths, id: string): Promise<Record<string, unkno
   try { report = await readFile(join(root, "report.md"), "utf8"); } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-  return { manifest, state, events, transcript, checkpoint: pending, report };
+  const renderedTranscript = transcript.map((record) => {
+    if (typeof record !== "object" || record === null || Array.isArray(record)) return record;
+    const typed = record as Record<string, unknown>;
+    return {
+      ...typed,
+      contentHtml: renderMarkdown(typeof typed.content === "string" ? typed.content : ""),
+    };
+  });
+  return {
+    manifest,
+    state,
+    events,
+    transcript: renderedTranscript,
+    checkpoint: pending,
+    report,
+    reportHtml: renderMarkdown(report),
+  };
 }
 
 export interface ObserverServer {
@@ -93,7 +113,7 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
   const token = randomBytes(32).toString("base64url");
   const server = createServer(async (request, response) => {
     try {
-      const url = new URL(request.url ?? "/", "http://127.0.0.1");
+      const url = new URL(request.url ?? "/", `http://${SERVER_HOST}`);
       if (request.method === "GET" && url.pathname === "/") return send(response, 200, INDEX_HTML, "text/html; charset=utf-8");
       if (request.method === "GET" && url.pathname === "/styles.css") return send(response, 200, STYLES_CSS, "text/css; charset=utf-8");
       if (request.method === "GET" && url.pathname === "/app.js") return send(response, 200, APP_JS, "text/javascript; charset=utf-8");
@@ -134,7 +154,7 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
           "X-Accel-Buffering": "no",
         });
         const publish = async (): Promise<void> => {
-          const events = await jsonLines(join(paths.deliberations, id, "events.jsonl"));
+          const events = await new ArchiveStore(paths.deliberations, id).readEvents();
           while (offset < events.length) {
             response.write(`id:${offset}\ndata:${JSON.stringify(events[offset])}\n\n`);
             offset += 1;
@@ -187,7 +207,7 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
+    server.listen(port, SERVER_HOST, resolve);
   });
   const address = server.address();
   if (!address || typeof address === "string") throw new Error("无法确定观察服务端口");
@@ -199,7 +219,7 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
   return {
     token,
     port: address.port,
-    url: `http://127.0.0.1:${address.port}/#token=${encodeURIComponent(token)}`,
+    url: `http://${SERVER_HOST}:${address.port}/#token=${encodeURIComponent(token)}`,
     close: async () => {
       const closed = new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
       server.closeAllConnections();

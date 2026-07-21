@@ -1,4 +1,4 @@
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -38,7 +38,8 @@ describe("DiscussionController", () => {
     });
     let evaluations = 0;
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      projectReadOnlyCapability: "runtime-canary", verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
       invoke: vi.fn(async ({ prompt }) => {
         let text = "参与者发言";
         if (prompt.includes("规划覆盖周期")) text = JSON.stringify({ order: ["host", "critic"] });
@@ -68,7 +69,8 @@ describe("DiscussionController", () => {
       mode: "free", interaction: "guided", plan: oneWindowPlan, planConfirmation: "interactive",
     });
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      projectReadOnlyCapability: "runtime-canary", verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
       invoke: vi.fn(async ({ prompt }) => {
         let text = "参与者发言";
         if (prompt.includes("规划覆盖周期")) text = JSON.stringify({ order: ["host", "critic"] });
@@ -95,7 +97,8 @@ describe("DiscussionController", () => {
     let evaluations = 0;
     const prompts: string[] = [];
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true,
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
       probe: vi.fn(async () => ({ ready: true })),
       check: vi.fn(async () => ({ ready: true })),
       invoke: vi.fn(async ({ prompt }) => {
@@ -119,5 +122,78 @@ describe("DiscussionController", () => {
     const draftPrompt = prompts.find((prompt) => prompt.includes("生成 Markdown 草稿"));
     expect(draftPrompt).toContain("主持调度不作为参与者观点");
     expect(draftPrompt).not.toContain("仍需核对风险");
+  });
+
+  it("records when automatic discussion stops at the window limit", async () => {
+    const limitedPlan: DeliberationPlan = { ...plan, limits: { ...plan.limits, maxDiscussionWindows: 1 } };
+    const root = await mkdtemp(join(tmpdir(), "mad-discussion-end-reason-"));
+    const archive = new ArchiveStore(root, "d1");
+    await archive.create({
+      schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "窗口上限",
+      mode: "free", interaction: "auto", plan: limitedPlan, planConfirmation: "auto-first-valid",
+    });
+    const adapter: CliAdapter = {
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
+      invoke: vi.fn(async ({ prompt }) => {
+        let text = "参与者发言";
+        if (prompt.includes("规划覆盖周期")) text = JSON.stringify({ order: ["host", "critic"] });
+        else if (prompt.includes("评估是否已充分收敛")) {
+          text = JSON.stringify({ speakers: ["host", "critic"], converged: false, rationale: "仍有分歧" });
+        } else if (prompt.includes("生成 Markdown 草稿")) text = "# 草稿";
+        else if (prompt.includes("完成一次最终修订")) {
+          text = "# 最终报告\n## 共识\n部分。\n## 未决争议\n仍有。\n## 假设\n有效。\n## 风险\n中。";
+        }
+        return { text, durationMs: 1, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } };
+      }),
+    };
+
+    const runner = new InvocationRunner(registry, archive, limitedPlan.limits.maxCalls, process.cwd(), () => adapter);
+    await new DiscussionController(registry, archive, limitedPlan, process.cwd(), undefined, runner).run("窗口上限");
+
+    const events = (await readFile(join(archive.path, "events.jsonl"), "utf8"))
+      .trim().split("\n").map((line) => JSON.parse(line) as { type: string; data?: { endReason?: string } });
+    expect(events).toContainEqual(expect.objectContaining({
+      type: "discussion.ended",
+      data: expect.objectContaining({ endReason: "max_windows" }),
+    }));
+  });
+
+  it("records a guided cancellation as an unrecoverable end reason", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-discussion-cancel-"));
+    const archive = new ArchiveStore(root, "d1");
+    await archive.create({
+      schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "取消讨论",
+      mode: "free", interaction: "guided", plan, planConfirmation: "interactive",
+    });
+    const adapter: CliAdapter = {
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
+      invoke: vi.fn(async ({ prompt }) => ({
+        text: prompt.includes("规划覆盖周期")
+          ? JSON.stringify({ order: ["host", "critic"] })
+          : prompt.includes("评估是否已充分收敛")
+            ? JSON.stringify({ speakers: ["host", "critic"], converged: false, rationale: "仍有分歧" })
+            : "参与者发言",
+        durationMs: 1,
+        diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
+      })),
+    };
+    const runner = new InvocationRunner(registry, archive, plan.limits.maxCalls, process.cwd(), () => adapter);
+
+    await expect(new DiscussionController(
+      registry,
+      archive,
+      plan,
+      process.cwd(),
+      async () => ({ action: "cancel" }),
+      runner,
+    ).run("取消讨论")).rejects.toThrow(/取消/);
+
+    expect((await archive.readState()).status).toBe("cancelled");
+    const events = await readFile(join(archive.path, "events.jsonl"), "utf8");
+    expect(events).toContain('"endReason":"cancelled"');
   });
 });

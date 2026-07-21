@@ -49,6 +49,12 @@ describe("CLI registry", () => {
     expect(() => parseCliRegistry(duplicate)).toThrowError(/重复调用预设/);
   });
 
+  it("rejects a preset context budget above the application safety maximum", () => {
+    const oversized = structuredClone(valid);
+    oversized.clis[0]!.presets[0]!.context_budget = 1_000_001;
+    expect(() => parseCliRegistry(oversized)).toThrow(/context_budget.*1000000/);
+  });
+
   it("does not treat the init template placeholder as a valid model", () => {
     const template = structuredClone(valid);
     template.clis[0]!.presets[0]!.model = "REPLACE_WITH_MODEL_ID";

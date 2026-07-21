@@ -3,7 +3,7 @@ import type { CliRegistry } from "../adapters/config.js";
 import { MadError } from "./errors.js";
 import { InvocationRunner } from "./execution.js";
 import { OutcomePipeline } from "./outcome.js";
-import { SharedContextManager } from "./context.js";
+import { estimateTokens, SharedContextManager } from "./context.js";
 import type { DeliberationAgent, DeliberationPlan } from "./types.js";
 import { createAdapter } from "../adapters/index.js";
 
@@ -101,6 +101,7 @@ export class DiscussionController {
     );
     this.runner.setSignal(signal);
     this.runner.setTimeoutSeconds(plan.limits.timeoutSeconds);
+    this.runner.setContextBudget(plan.limits.contextBudget);
     this.context = new SharedContextManager(registry, this.runner, plan);
   }
 
@@ -111,6 +112,7 @@ export class DiscussionController {
     const speeches: Speech[] = [];
     let windows = 0;
     let converged = false;
+    let endReason: "moderator_converged" | "user_end" | "max_windows" = "max_windows";
     try {
       const moderator = this.agent(this.plan.moderatorAgentId!);
       const participantIds = this.plan.participants.map((agent) => agent.id);
@@ -131,9 +133,13 @@ export class DiscussionController {
         const decision = await this.atBoundary(windows, moderatorPlan);
         if (decision === "end") {
           converged = moderatorPlan.converged;
+          endReason = moderatorPlan.converged ? "moderator_converged" : "user_end";
           break;
         }
-        if (windows >= this.plan.limits.maxDiscussionWindows) break;
+        if (windows >= this.plan.limits.maxDiscussionWindows) {
+          endReason = "max_windows";
+          break;
+        }
         windows += 1;
         for (const agentId of moderatorPlan.speakers) {
           await this.speak(question, this.agent(agentId), `window_${windows}`, speeches);
@@ -141,31 +147,48 @@ export class DiscussionController {
         moderatorPlan = await this.evaluate(question, moderator, participantIds, speeches, windows);
       }
       if (moderatorPlan.converged) converged = true;
-      const evidence = `自由讨论权威发言记录（主持调度不作为参与者观点）：\n${await this.context.snapshot(question)}\n\n` +
-        `讨论状态：${converged ? "主持判断已收敛" : "达到用户结束或窗口上限，可能仍有未决争议"}`;
-      const report = await new OutcomePipeline(this.runner, this.plan, this.context).run(question, evidence, () => this.guidanceText());
+      await this.archive.appendEvent("discussion.ended", {
+        endReason,
+        windows,
+        rounds: speeches.length,
+        converged,
+      });
+      const supplementalEvidence = `\n\n自由讨论权威发言记录（主持调度不作为参与者观点）` +
+        `\n讨论状态：${converged ? "主持判断已收敛" : "达到用户结束或窗口上限，可能仍有未决争议"}`;
+      const report = await new OutcomePipeline(this.runner, this.plan, this.context).run(
+        question,
+        supplementalEvidence,
+        () => this.guidanceText(),
+      );
       await this.archive.writeReport(report);
       await this.archive.setStatus("completed");
       const state = await this.archive.readState();
       return { report, rounds: speeches.length, windows, converged, callAttempts: state.callAttempts };
     } catch (error) {
-      if (error instanceof MadError && error.code === "CANCELLED") await this.archive.setStatus("cancelled");
-      else await this.archive.setStatus("paused");
+      if (error instanceof MadError && error.code === "CANCELLED") {
+        await this.archive.appendEvent("discussion.ended", { endReason: "cancelled", windows, rounds: speeches.length });
+        await this.archive.setStatus("cancelled");
+      } else {
+        await this.archive.appendEvent("discussion.ended", { endReason: "paused", windows, rounds: speeches.length });
+        await this.archive.setStatus("paused");
+      }
       throw error;
     }
   }
 
   private async speak(question: string, agent: DeliberationAgent, phase: string, speeches: Speech[]): Promise<void> {
     const round = speeches.length + 1;
-    const sharedContext = await this.context.snapshot(question);
+    const prompt = (sharedContext: string): string =>
+      `你是 ${agent.id}，本次角色：${agent.role}\n问题：${question}\n此前共享权威上下文：\n${sharedContext}\n` +
+      `这是你的第 ${round} 个讨论回合。回应相关观点，推进结论，明确分歧；不要代替主持人调度。${this.guidanceText()}`;
+    const sharedContext = await this.context.snapshot(question, estimateTokens(prompt("")) + 1);
     const output = await this.runner.run({
       id: `discussion:speech:${phase}:${round}:${agent.id}`,
       kind: "contribution",
       agentId: agent.id,
       invocation: agent.invocation,
       stage: "discussion_speech",
-      prompt: `你是 ${agent.id}，本次角色：${agent.role}\n问题：${question}\n此前共享权威上下文：\n${sharedContext}\n` +
-        `这是你的第 ${round} 个讨论回合。回应相关观点，推进结论，明确分歧；不要代替主持人调度。${this.guidanceText()}`,
+      prompt: prompt(sharedContext),
     });
     speeches.push({ round, agentId: agent.id, content: output.value });
     this.context.add(`回合 ${round} · ${agent.id}`, output.value);
@@ -179,16 +202,18 @@ export class DiscussionController {
     window: number,
   ): Promise<ModeratorPlan> {
     const lastSpeaker = speeches.at(-1)?.agentId ?? "";
-    const sharedContext = await this.context.snapshot(question);
+    const prompt = (sharedContext: string): string =>
+      `你是主持 Agent ${moderator.id}。问题：${question}\n共享权威参与者上下文：\n${sharedContext}\n` +
+      `评估是否已充分收敛；若未收敛，为下一个窗口规划恰好 ${participantIds.length} 个发言者。允许重复但不得连续选择同一人，第一位不能是上一位 ${lastSpeaker}。` +
+      `主持判断只用于调度，不是参与者观点。只输出 JSON：{"speakers":["agent-id"],"converged":false,"rationale":"理由"}${this.guidanceText()}`;
+    const sharedContext = await this.context.snapshot(question, estimateTokens(prompt("")) + 1);
     const result = await this.runner.run({
       id: `discussion:moderator:window:${window}`,
       kind: "moderator",
       agentId: moderator.id,
       invocation: moderator.invocation,
       stage: "moderator_window",
-      prompt: `你是主持 Agent ${moderator.id}。问题：${question}\n共享权威参与者上下文：\n${sharedContext}\n` +
-        `评估是否已充分收敛；若未收敛，为下一个窗口规划恰好 ${participantIds.length} 个发言者。允许重复但不得连续选择同一人，第一位不能是上一位 ${lastSpeaker}。` +
-        `主持判断只用于调度，不是参与者观点。只输出 JSON：{"speakers":["agent-id"],"converged":false,"rationale":"理由"}${this.guidanceText()}`,
+      prompt: prompt(sharedContext),
       parse: (text) => parseModeratorPlan(text, participantIds, lastSpeaker),
     });
     return result.value;

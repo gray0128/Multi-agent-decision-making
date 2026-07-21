@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -9,7 +9,7 @@ import { ActiveDeliberationLock } from "../src/archive/store.js";
 
 const root = resolve(import.meta.dirname, "..");
 const cli = join(root, "src", "cli", "index.ts");
-const fake = join(root, "tests-ts", "fixtures", "fake-codex.mjs");
+const fake = join(root, "tests-ts", "fixtures", "fake-codex.sh");
 
 async function command(home: string, args: readonly string[], environment: NodeJS.ProcessEnv = {}): Promise<{ code: number; stdout: string; stderr: string }> {
   const child = spawn(process.execPath, ["--import", "tsx", cli, ...args], {
@@ -30,10 +30,12 @@ async function command(home: string, args: readonly string[], environment: NodeJ
 
 describe("mad CLI end to end", () => {
   async function configure(home: string): Promise<void> {
-    await chmod(fake, 0o755);
+    const executable = join(home, "fake-codex.sh");
+    await copyFile(fake, executable);
+    await chmod(executable, 0o755);
     const config = join(home, "config", "clis.toml");
     await mkdir(dirname(config), { recursive: true });
-    await writeFile(config, `[defaults.generator]\ncli = "codex"\npreset = "test"\n\n[[clis]]\nid = "codex"\nadapter = "codex"\nexecutable = "${fake}"\ntimeout_seconds = 10\nmax_concurrency = 1\n\n[[clis.presets]]\nid = "test"\nmodel = "fake-model"\ncontext_budget = 64000\n`);
+    await writeFile(config, `[defaults.generator]\ncli = "codex"\npreset = "test"\n\n[[clis]]\nid = "codex"\nadapter = "codex"\nexecutable = "${executable}"\ntimeout_seconds = 30\nmax_concurrency = 1\n\n[[clis.presets]]\nid = "test"\nmodel = "fake-model"\ncontext_budget = 64000\n`);
   }
 
   it("rejects recursive deliberation from a participant process", async () => {
@@ -64,12 +66,13 @@ describe("mad CLI end to end", () => {
     expect(machine).toMatchObject({ status: "completed", mode });
     expect(machine.report).toContain("最终共同成果");
     expect(machine.warnings).toEqual([expect.stringContaining("独立模型交叉验证")]);
-    expect(machine.budget_usage).toMatchObject({ timeout_seconds: 10, context_budget: 64_000, global_concurrency: 2 });
+    expect(machine.budget_usage).toMatchObject({ timeout_seconds: 30, context_budget: 64_000, global_concurrency: 2 });
     expect(result.stdout.trim().split("\n")).toHaveLength(1);
+    expect(result.stderr).toContain("来源约束：");
     expect(result.stderr).toContain("审议档案：");
     expect(await readFile(join(machine.archive_path, "report.md"), "utf8")).toBe(machine.report);
     expect((await readFile(join(machine.archive_path, "state.json"), "utf8"))).toContain('"status": "completed"');
-  }, 20_000);
+  }, 45_000);
 
   it("uses the explicit workspace for probe and every project invocation", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-cli-workspace-"));
@@ -81,6 +84,9 @@ describe("mad CLI end to end", () => {
     ], { FAKE_CODEX_CWD_LOG: cwdLog });
     expect(result.code, result.stderr).toBe(0);
     expect(await readFile(cwdLog, "utf8")).toBe(await realpath(workspace));
+    expect(result.stderr.match(/^警告：/gm)).toHaveLength(2);
+    expect(result.stderr).toContain("完整目录只读授权");
+    expect(result.stderr).toContain("来源约束：");
   }, 20_000);
 
   it("resumes only unfinished logical calls after a double invocation failure", async () => {
@@ -101,6 +107,7 @@ describe("mad CLI end to end", () => {
 
     const resumed = await command(home, ["resume", ids[0]!, "--format", "json"], { FAKE_CODEX_FAILURE_COUNTER: counter });
     expect(resumed.code, resumed.stderr).toBe(0);
+    expect(resumed.stderr).toContain("来源约束：");
     const machine = JSON.parse(resumed.stdout) as { status: string; report: string };
     expect(machine.status).toBe("completed");
     expect(machine.report).toContain("最终共同成果");

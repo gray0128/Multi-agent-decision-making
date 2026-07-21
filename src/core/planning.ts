@@ -132,9 +132,7 @@ export class OrganizerService {
     const organizer = request.organizer ?? this.registry.defaults.generator;
     const generator = resolveInvocation(this.registry, organizer.cli, organizer.preset);
     const generatorAdapter = this.adapterFactory(generator.cli, generator.preset);
-    if (request.projectMode && !generatorAdapter.supportsProjectReadOnly) {
-      throw new MadError("PREFLIGHT", `${organizer.cli}/${organizer.preset} 未证明支持最低只读约束，禁止作为项目组局器`);
-    }
+    if (request.projectMode) await this.requireProjectReadOnly(generatorAdapter, `${organizer.cli}/${organizer.preset}`, request.signal);
     await this.requireReady(generatorAdapter, request.cwd, `${organizer.cli}/${organizer.preset}`, request.signal);
     const prompt = this.buildPrompt(request, organizer);
     let plan: DeliberationPlan | undefined;
@@ -190,15 +188,15 @@ export class OrganizerService {
       if (!combinations.has(key)) {
         const resolved = resolveInvocation(this.registry, participant.invocation.cli, participant.invocation.preset);
         const adapter = this.adapterFactory(resolved.cli, resolved.preset);
-        if (projectMode && !adapter.supportsProjectReadOnly) {
-          throw new MadError("PREFLIGHT", `${key} 未证明支持最低只读约束，禁止项目模式`);
-        }
         combinations.set(key, { adapter, cliId: resolved.cli.id, maximum: resolved.cli.maxConcurrency });
       }
     }
     const scheduler = new InvocationScheduler(plan.limits.globalConcurrency ?? 6);
     await settleAllOrThrow([...combinations].map(([key, value]) =>
-      scheduler.run(value.cliId, value.maximum, () => this.requireReady(value.adapter, cwd, key, signal))));
+      scheduler.run(value.cliId, value.maximum, async () => {
+        if (projectMode) await this.requireProjectReadOnly(value.adapter, key, signal);
+        await this.requireReady(value.adapter, cwd, key, signal);
+      })));
     return [...combinations.keys()];
   }
 
@@ -206,6 +204,17 @@ export class OrganizerService {
     const result = await adapter.check(cwd, signal);
     if (signal?.aborted) throw new MadError("PAUSED", "审议已暂停");
     if (!result.ready) throw new MadError("PREFLIGHT", `${label} 预检失败：${result.detail ?? "未知错误"}`);
+  }
+
+  private async requireProjectReadOnly(adapter: CliAdapter, label: string, signal?: AbortSignal): Promise<void> {
+    if (adapter.projectReadOnlyCapability === "unsupported") {
+      throw new MadError("PREFLIGHT", `${label} 未证明支持最低只读约束，禁止项目模式`);
+    }
+    const result = await adapter.verifyProjectReadOnly(signal);
+    if (signal?.aborted) throw new MadError("PAUSED", "审议已暂停");
+    if (!result.verified) {
+      throw new MadError("PREFLIGHT", `${label} 项目只读验证失败：${result.detail ?? "证据不足"}`);
+    }
   }
 
   private buildPrompt(request: OrganizerRequest, organizer: InvocationPresetRef): string {

@@ -44,16 +44,26 @@ export class SharedContextManager {
     for (const [label, content] of values) this.add(label, content);
   }
 
-  public async snapshot(question: string): Promise<string> {
+  public async snapshot(question: string, reserveTokens = 0): Promise<string> {
+    if (!Number.isSafeInteger(reserveTokens) || reserveTokens < 0) {
+      throw new MadError("EXECUTION", "上下文预留预算必须是非负整数");
+    }
+    const availableForContext = this.contextBudget - reserveTokens;
+    if (availableForContext < 32) throw new MadError("EXECUTION", "固定提示已经占满上下文预算");
     const current = this.renderCurrent();
-    const targetTokens = Math.max(32, Math.floor(this.contextBudget * 0.45));
+    const targetTokens = Math.max(32, Math.min(Math.floor(this.contextBudget * 0.45), availableForContext));
     if (estimateTokens(current) <= targetTokens) return current;
     const reportAgent = this.plan.participants.find((participant) => participant.id === this.plan.reportAgentId);
     if (!reportAgent) throw new MadError("EXECUTION", "报告 Agent 不存在，无法生成统一滚动摘要");
     const through = this.entries.length;
-    const maximumCharacters = Math.max(32, Math.floor(this.contextBudget * 4 * 0.1));
+    const summaryHeaderTokens = estimateTokens("# 统一滚动摘要\n");
+    const sourceTargetTokens = Math.max(16, targetTokens - summaryHeaderTokens);
+    const maximumCharacters = Math.max(
+      32,
+      Math.floor(Math.min(this.contextBudget * 0.1, sourceTargetTokens) * 4),
+    );
     let source = current;
-    for (let round = 0; estimateTokens(source) > targetTokens; round += 1) {
+    for (let round = 0; estimateTokens(source) > sourceTargetTokens; round += 1) {
       if (round >= 12) throw new MadError("EXECUTION", "滚动摘要无法压缩到上下文预算内");
       const prefix = `你是报告 Agent ${reportAgent.id}。为所有参与者压缩一段权威记录。\n问题：${question}\n` +
         `保留身份、证据、立场、争议、假设、风险和任务约束；不加入新判断；不得把共享来源说成独立模型验证。` +

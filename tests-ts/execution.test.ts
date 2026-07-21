@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { CliRegistry } from "../src/adapters/config.js";
 import type { CliAdapter } from "../src/adapters/types.js";
 import { ArchiveStore } from "../src/archive/store.js";
-import { InvocationRunner } from "../src/core/execution.js";
+import { InvocationRunner, InvocationScheduler } from "../src/core/execution.js";
 import type { DeliberationManifest } from "../src/core/types.js";
 import { MadError } from "../src/core/errors.js";
 
@@ -23,7 +23,8 @@ describe("InvocationRunner", () => {
     const archive = new ArchiveStore(root, "d1");
     await archive.create({ schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "问题", mode: "structured", interaction: "auto" });
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      projectReadOnlyCapability: "runtime-canary", verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
       invoke: vi.fn(async () => { throw new MadError("EXECUTION", "认证失败"); }),
     };
     const runner = new InvocationRunner(registry, archive, 20, process.cwd(), () => adapter);
@@ -39,7 +40,8 @@ describe("InvocationRunner", () => {
     const archive = new ArchiveStore(root, "d1");
     await archive.create({ schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "问题", mode: "structured", interaction: "auto" });
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      projectReadOnlyCapability: "runtime-canary", verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
       invoke: vi.fn()
         .mockResolvedValueOnce({ text: "invalid", durationMs: 1, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } })
         .mockResolvedValueOnce({ text: '{"ok":true}', durationMs: 1, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } }),
@@ -66,6 +68,23 @@ describe("InvocationRunner", () => {
       id: "too-large", kind: "contribution", agentId: "a", invocation: registry.defaults.generator,
       prompt: "x".repeat(300_000), stage: "independent",
     })).rejects.toThrow(/上下文预算/);
+    expect(adapter.invoke).not.toHaveBeenCalled();
+  });
+
+  it("enforces the per-deliberation context budget even when the preset is larger", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-execution-plan-context-"));
+    const archive = new ArchiveStore(root, "d1");
+    await archive.create({
+      schemaVersion: 1, id: "d1", createdAt: new Date().toISOString(), question: "问题",
+      mode: "structured", interaction: "auto", planConfirmation: "auto-first-valid",
+    });
+    const adapter = { invoke: vi.fn() } as unknown as CliAdapter;
+    const runner = new InvocationRunner(registry, archive, 20, process.cwd(), () => adapter);
+    runner.setContextBudget(100);
+    await expect(runner.run({
+      id: "plan-too-large", kind: "contribution", agentId: "a", invocation: registry.defaults.generator,
+      prompt: "x".repeat(500), stage: "independent",
+    })).rejects.toThrow(/上下文预算 100/);
     expect(adapter.invoke).not.toHaveBeenCalled();
   });
 
@@ -98,7 +117,8 @@ describe("InvocationRunner", () => {
     await archive.create(manifest);
     let calls = 0;
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true,
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
       probe: vi.fn(), check: vi.fn(),
       invoke: vi.fn(async () => {
         calls += 1;
@@ -113,5 +133,35 @@ describe("InvocationRunner", () => {
     expect(output.value).toBe("answer-1");
     expect(calls).toBe(1);
     expect((await archive.readState()).completedInvocations["call-1"]?.text).toBe("answer-1");
+  });
+});
+
+describe("InvocationScheduler", () => {
+  it("enforces both the global limit and the shared per-CLI limit", async () => {
+    const scheduler = new InvocationScheduler(2);
+    let activeGlobal = 0;
+    let maximumGlobal = 0;
+    let activeShared = 0;
+    let maximumShared = 0;
+    const operation = async (shared: boolean): Promise<void> => {
+      activeGlobal += 1;
+      maximumGlobal = Math.max(maximumGlobal, activeGlobal);
+      if (shared) {
+        activeShared += 1;
+        maximumShared = Math.max(maximumShared, activeShared);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      if (shared) activeShared -= 1;
+      activeGlobal -= 1;
+    };
+
+    await Promise.all([
+      scheduler.run("shared", 1, () => operation(true)),
+      scheduler.run("shared", 1, () => operation(true)),
+      scheduler.run("other", 2, () => operation(false)),
+    ]);
+
+    expect(maximumGlobal).toBe(2);
+    expect(maximumShared).toBe(1);
   });
 });

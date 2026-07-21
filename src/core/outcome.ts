@@ -1,6 +1,7 @@
 import type { DeliberationAgent, DeliberationPlan } from "./types.js";
 import { settleAllOrThrow, type InvocationRunner } from "./execution.js";
 import type { SharedContextManager } from "./context.js";
+import { estimateTokens } from "./tokens.js";
 
 export function sharedOriginWarning(plan: DeliberationPlan): string {
   const counts = new Map<string, number>();
@@ -39,27 +40,40 @@ export class OutcomePipeline {
 
   public async run(
     question: string,
-    evidence: string,
+    supplementalEvidence: string,
     guidance: string | (() => string) = "",
     onDraft?: (draft: string) => Promise<void>,
   ): Promise<string> {
     const reportAgent = this.agent(this.plan.reportAgentId);
     const currentGuidance = (): string => typeof guidance === "function" ? guidance() : guidance;
+    if (this.context && supplementalEvidence.trim()) this.context.add("补充证据", supplementalEvidence.trim());
+    const draftPrompt = (evidence: string): string =>
+      `你是报告 Agent ${reportAgent.id}。问题：${question}\n${sharedOriginWarning(this.plan)}\n${evidence}` +
+      `${this.context ? "" : supplementalEvidence}\n` +
+      `生成 Markdown 草稿，明确区分共识、未决争议、假设和风险，不得虚构一致意见。${currentGuidance()}`;
+    const evidence = this.context
+      ? await this.context.snapshot(question, estimateTokens(draftPrompt("")) + 1)
+      : "";
     const draft = await this.runner.run({
       id: "outcome:report:draft",
       kind: "draft",
       agentId: reportAgent.id,
       invocation: reportAgent.invocation,
       stage: "report_draft",
-      prompt: `你是报告 Agent ${reportAgent.id}。问题：${question}\n${sharedOriginWarning(this.plan)}\n${evidence}\n` +
-        `生成 Markdown 草稿，明确区分共识、未决争议、假设和风险，不得虚构一致意见。${currentGuidance()}`,
+      prompt: draftPrompt(evidence),
     });
     await onDraft?.(draft.value);
     this.context?.add("报告草稿", draft.value);
-    const reviewContext = this.context
-      ? await this.context.snapshot(question)
-      : `${evidence}\n\n## 报告草稿\n${draft.value}`;
     const reviewers = this.plan.participants.filter((agent) => agent.id !== reportAgent.id);
+    const reviewPrompt = (agent: DeliberationAgent, reviewContext: string): string =>
+      `你是审阅者 ${agent.id}，角色：${agent.role}\n问题：${question}\n权威证据与报告草稿：\n${reviewContext}\n` +
+      `检查是否忠实反映各方观点、来源共享、未决争议、假设与风险；给出具体修订建议。${currentGuidance()}`;
+    const reviewReserve = reviewers.length
+      ? Math.max(...reviewers.map((agent) => estimateTokens(reviewPrompt(agent, "")))) + 1
+      : 0;
+    const reviewContext = this.context
+      ? await this.context.snapshot(question, reviewReserve)
+      : `${supplementalEvidence}\n\n## 报告草稿\n${draft.value}`;
     const reviewValues = await settleAllOrThrow(reviewers.map(async (agent) => {
       const review = await this.runner.run({
         id: `outcome:review:${agent.id}`,
@@ -67,14 +81,16 @@ export class OutcomePipeline {
         agentId: agent.id,
         invocation: agent.invocation,
         stage: "review",
-        prompt: `你是审阅者 ${agent.id}，角色：${agent.role}\n问题：${question}\n权威证据与报告草稿：\n${reviewContext}\n` +
-          `检查是否忠实反映各方观点、来源共享、未决争议、假设与风险；给出具体修订建议。${currentGuidance()}`,
+        prompt: reviewPrompt(agent, reviewContext),
       });
       return [agent.id, review.value] as const;
     }));
     this.context?.addMany(reviewValues.map(([agentId, value]) => [`报告审阅 · ${agentId}`, value] as const));
+    const finalPrompt = (finalContext: string): string =>
+      `你是报告 Agent ${reportAgent.id}。问题：${question}\n权威证据、草稿与审阅意见：\n${finalContext}\n` +
+      `${sharedOriginWarning(this.plan)}\n${currentGuidance()}\n完成一次最终修订，只输出最终 Markdown 报告。`;
     const finalContext = this.context
-      ? await this.context.snapshot(question)
+      ? await this.context.snapshot(question, estimateTokens(finalPrompt("")) + 1)
       : `${reviewContext}\n\n## 审阅意见\n${render(new Map(reviewValues))}`;
     const final = await this.runner.run({
       id: "outcome:report:final",
@@ -82,8 +98,7 @@ export class OutcomePipeline {
       agentId: reportAgent.id,
       invocation: reportAgent.invocation,
       stage: "report_final",
-      prompt: `你是报告 Agent ${reportAgent.id}。问题：${question}\n权威证据、草稿与审阅意见：\n${finalContext}\n` +
-        `${sharedOriginWarning(this.plan)}\n${currentGuidance()}\n完成一次最终修订，只输出最终 Markdown 报告。`,
+      prompt: finalPrompt(finalContext),
       parse: validateFinalReport,
     });
     return final.value;

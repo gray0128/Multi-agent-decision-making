@@ -75,6 +75,7 @@ export interface LogicalInvocationOutput<T> {
 export class InvocationRunner {
   private defaultSignal: AbortSignal | undefined;
   private timeoutSeconds: number | undefined;
+  private contextBudget: number | undefined;
   private readonly scheduler: InvocationScheduler;
   public constructor(
     private readonly registry: CliRegistry,
@@ -96,13 +97,18 @@ export class InvocationRunner {
     this.timeoutSeconds = timeoutSeconds;
   }
 
+  public setContextBudget(contextBudget: number): void {
+    this.contextBudget = contextBudget;
+  }
+
   public async run<T = string>(call: LogicalInvocation<T>): Promise<LogicalInvocationOutput<T>> {
     const resolved = resolveInvocation(this.registry, call.invocation.cli, call.invocation.preset);
     const inputTokens = estimateTokens(call.prompt);
-    if (inputTokens > resolved.preset.contextBudget) {
+    const contextBudget = Math.min(this.contextBudget ?? resolved.preset.contextBudget, resolved.preset.contextBudget);
+    if (inputTokens > contextBudget) {
       throw new MadError(
         "EXECUTION",
-        `逻辑调用 ${call.id} 的输入估算为 ${inputTokens} tokens，超过上下文预算 ${resolved.preset.contextBudget}`,
+        `逻辑调用 ${call.id} 的输入估算为 ${inputTokens} tokens，超过上下文预算 ${contextBudget}`,
       );
     }
     const frozen: FrozenInvocation = {

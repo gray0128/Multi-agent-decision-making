@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { MadError } from "../core/errors.js";
 import { assertDeliberationId } from "../core/paths.js";
 import type { DeliberationManifest, FrozenInvocation, InvocationResult } from "../core/types.js";
+import { redactDiagnostic } from "./redact.js";
+import { parseArchiveEvent, parseDeliberationManifest, parseDeliberationState } from "./schema.js";
 
 export interface DeliberationState {
   readonly schemaVersion: 1;
@@ -76,24 +78,12 @@ export class ArchiveStore {
   }
 
   public async readState(): Promise<DeliberationState> {
-    const value: unknown = JSON.parse(await readFile(join(this.path, "state.json"), "utf8"));
-    const version = typeof value === "object" && value !== null
-      ? ((value as { schema_version?: unknown }).schema_version ?? (value as { schemaVersion?: unknown }).schemaVersion)
-      : undefined;
-    if (typeof value !== "object" || value === null || version !== 1) {
-      throw new MadError("EXECUTION", `不支持的审议状态：${this.deliberationId}`);
-    }
-    const { schema_version: _snakeVersion, ...rest } = value as Record<string, unknown>;
-    const state = rest as unknown as DeliberationState;
-    return {
-      ...state,
-      schemaVersion: 1,
-      checkpointDecisions: state.checkpointDecisions ?? {},
-    };
+    return parseDeliberationState(JSON.parse(await readFile(join(this.path, "state.json"), "utf8")));
   }
 
   public async writeState(state: DeliberationState): Promise<void> {
-    const { schemaVersion: _schemaVersion, ...value } = state;
+    const validated = parseDeliberationState(state);
+    const { schemaVersion: _schemaVersion, ...value } = validated;
     await atomicJson(join(this.path, "state.json"), { schema_version: 1, ...value });
   }
 
@@ -202,19 +192,12 @@ export class ArchiveStore {
   }
 
   public async readManifest(): Promise<DeliberationManifest> {
-    const value: unknown = JSON.parse(await readFile(join(this.path, "manifest.json"), "utf8"));
-    const version = typeof value === "object" && value !== null
-      ? ((value as { schema_version?: unknown }).schema_version ?? (value as { schemaVersion?: unknown }).schemaVersion)
-      : undefined;
-    if (typeof value !== "object" || value === null || version !== 1) {
-      throw new MadError("EXECUTION", `不支持的审议清单：${this.deliberationId}`);
-    }
-    const { schema_version: _snakeVersion, ...rest } = value as Record<string, unknown>;
-    return { ...rest, schemaVersion: 1 } as unknown as DeliberationManifest;
+    return parseDeliberationManifest(JSON.parse(await readFile(join(this.path, "manifest.json"), "utf8")));
   }
 
   public async writeManifest(manifest: DeliberationManifest): Promise<void> {
-    const { schemaVersion: _schemaVersion, ...manifestValue } = manifest;
+    const validated = parseDeliberationManifest(manifest);
+    const { schemaVersion: _schemaVersion, ...manifestValue } = validated;
     await atomicJson(join(this.path, "manifest.json"), { schema_version: 1, ...manifestValue });
   }
 
@@ -232,16 +215,32 @@ export class ArchiveStore {
   }
 
   public async appendDiagnostic(record: unknown): Promise<void> {
-    await appendFile(join(this.path, "diagnostics.jsonl"), `${JSON.stringify(record)}\n`, { encoding: "utf8", mode: 0o600 });
+    await appendFile(
+      join(this.path, "diagnostics.jsonl"),
+      `${JSON.stringify(redactDiagnostic(record))}\n`,
+      { encoding: "utf8", mode: 0o600 },
+    );
+  }
+
+  public async readEvents(): Promise<ArchiveEvent[]> {
+    try {
+      return (await readFile(join(this.path, "events.jsonl"), "utf8"))
+        .split("\n")
+        .filter(Boolean)
+        .map((line) => parseArchiveEvent(JSON.parse(line)));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw error;
+    }
   }
 
   public async appendEvent(type: string, data?: unknown): Promise<void> {
-    const event: ArchiveEvent = {
+    const event = parseArchiveEvent({
       id: randomUUID(),
       at: new Date().toISOString(),
       type,
       ...(data === undefined ? {} : { data }),
-    };
+    });
     await appendFile(join(this.path, "events.jsonl"), `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
   }
 

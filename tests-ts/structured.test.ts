@@ -55,7 +55,8 @@ describe("StructuredController", () => {
     await archive.create(manifest("d1"));
     let slowFinished = false;
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true,
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
       probe: vi.fn(),
       check: vi.fn(),
       invoke: vi.fn(async ({ prompt }) => {
@@ -79,7 +80,8 @@ describe("StructuredController", () => {
     let maximumActive = 0;
     const prompts: string[] = [];
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true,
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
       probe: vi.fn(async () => ({ ready: true })),
       check: vi.fn(async () => ({ ready: true })),
       invoke: vi.fn(async ({ prompt }) => {

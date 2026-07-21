@@ -59,7 +59,8 @@ describe("fixed organizer", () => {
 
   it("preflights each unique invocation combination only once", async () => {
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true,
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
       probe: vi.fn(async () => ({ ready: true })),
       check: vi.fn(async () => ({ ready: true })),
       invoke: vi.fn(async () => ({
@@ -80,6 +81,26 @@ describe("fixed organizer", () => {
     expect(factory).toHaveBeenCalledTimes(2);
   });
 
+  it("blocks project deliberation when runtime read-only verification is inconclusive", async () => {
+    const plan = parseDeliberationPlan(structuredPayload, {
+      registry,
+      mode: "structured",
+      limits: DEFAULT_LIMITS,
+      organizer: registry.defaults.generator,
+    });
+    const adapter: CliAdapter = {
+      projectReadOnlyCapability: "runtime-canary",
+      probe: vi.fn(),
+      check: vi.fn(async () => ({ ready: true })),
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: false, detail: "未证明写操作被阻断" })),
+      invoke: vi.fn(),
+    };
+
+    await expect(new OrganizerService(registry, () => adapter).preflightPlan(plan, process.cwd(), undefined, true))
+      .rejects.toThrow(/未证明写操作被阻断/);
+    expect(adapter.check).not.toHaveBeenCalled();
+  });
+
   it("blocks an adapter without proven read-only mode from project deliberation", async () => {
     const reasonixRegistry: CliRegistry = {
       defaults: registry.defaults,
@@ -95,7 +116,13 @@ describe("fixed organizer", () => {
       ],
       report_agent_id: "b",
     }), { registry: reasonixRegistry, mode: "structured", limits: DEFAULT_LIMITS, organizer: registry.defaults.generator });
-    const adapter = { supportsProjectReadOnly: false, probe: vi.fn(), check: vi.fn(), invoke: vi.fn() } as unknown as CliAdapter;
+    const adapter: CliAdapter = {
+      projectReadOnlyCapability: "unsupported",
+      probe: vi.fn(),
+      check: vi.fn(),
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: false })),
+      invoke: vi.fn(),
+    };
     await expect(new OrganizerService(reasonixRegistry, () => adapter).preflightPlan(plan, process.cwd(), undefined, true))
       .rejects.toThrow(/禁止项目模式/);
   });

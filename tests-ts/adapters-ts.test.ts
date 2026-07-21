@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AdapterId, CliConfig, InvocationPreset } from "../src/adapters/config.js";
-import { buildInvocationCommand, buildProbeCommand } from "../src/adapters/generic.js";
+import { buildInvocationCommand, buildProbeCommand, genericExitError } from "../src/adapters/generic.js";
 import { publicError, publicText } from "../src/adapters/public-text.js";
 import { runProcess } from "../src/adapters/process.js";
 
@@ -72,5 +72,11 @@ describe("typed CLI adapters", () => {
     ].join("\n");
     expect(publicText(raw)).toBe("");
     expect(publicError(raw)).toBe("401 invalid api key");
+  });
+
+  it("classifies a non-zero generic CLI exit without exposing its secret", () => {
+    const message = genericExitError("agy", 1, "token=fake-sensitive-token-123456").message;
+    expect(message).toContain("[REDACTED]");
+    expect(message).not.toContain("fake-sensitive-token-123456");
   });
 });

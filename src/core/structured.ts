@@ -3,7 +3,7 @@ import type { CliRegistry } from "../adapters/config.js";
 import { MadError } from "./errors.js";
 import { InvocationRunner, settleAllOrThrow } from "./execution.js";
 import { OutcomePipeline } from "./outcome.js";
-import { SharedContextManager } from "./context.js";
+import { estimateTokens, SharedContextManager } from "./context.js";
 import type { DeliberationAgent, DeliberationPlan } from "./types.js";
 import { createAdapter } from "../adapters/index.js";
 
@@ -79,6 +79,7 @@ export class StructuredController {
     );
     this.runner.setSignal(signal);
     this.runner.setTimeoutSeconds(plan.limits.timeoutSeconds);
+    this.runner.setContextBudget(plan.limits.contextBudget);
     this.context = new SharedContextManager(registry, this.runner, plan);
   }
 
@@ -93,15 +94,23 @@ export class StructuredController {
       this.context.addMany(this.plan.participants.map((agent) => [`独立陈述 · ${agent.id}`, independent.get(agent.id)!] as const));
       await this.pauseAt("independent", renderOutputs(independent));
 
-      const independentContext = await this.context.snapshot(question);
+      const challengePrompt = (agent: DeliberationAgent, sharedContext: string): string =>
+        `你是 ${agent.id}，角色：${agent.role}\n问题：${question}\n共享权威上下文：\n${sharedContext}\n` +
+        `质疑薄弱证据、指出遗漏并补充材料。${this.guidanceText()}`;
+      const challengeReserve = Math.max(...this.plan.participants.map((agent) => estimateTokens(challengePrompt(agent, "")))) + 1;
+      const independentContext = await this.context.snapshot(question, challengeReserve);
       const challenge = await this.parallel("challenge", this.plan.participants, (agent) =>
-        `你是 ${agent.id}，角色：${agent.role}\n问题：${question}\n共享权威上下文：\n${independentContext}\n` +
-        `质疑薄弱证据、指出遗漏并补充材料。${this.guidanceText()}`,
+        challengePrompt(agent, independentContext),
       );
       this.context.addMany(this.plan.participants.map((agent) => [`质疑补充 · ${agent.id}`, challenge.get(agent.id)!] as const));
       await this.pauseAt("challenge", renderOutputs(challenge));
 
-      const challengeContext = await this.context.snapshot(question);
+      const revisionPrompt = (agent: DeliberationAgent, sharedContext: string): string =>
+        `你是 ${agent.id}，角色：${agent.role}\n问题：${question}\n共享权威上下文：\n${sharedContext}\n` +
+        `修订你的立场并标记关键争议。只输出 JSON：` +
+        `{"position":"修订意见","disputes":[{"topic":"争议主题","stance":"你的明确立场","confidence":"low|medium|high"}]}${this.guidanceText()}`;
+      const revisionReserve = Math.max(...this.plan.participants.map((agent) => estimateTokens(revisionPrompt(agent, "")))) + 1;
+      const challengeContext = await this.context.snapshot(question, revisionReserve);
       const revisions = new Map<string, Revision>();
       await settleAllOrThrow(this.plan.participants.map(async (agent) => {
         const output = await this.runner.run({
@@ -110,9 +119,7 @@ export class StructuredController {
           agentId: agent.id,
           invocation: agent.invocation,
           stage: "revision",
-          prompt: `你是 ${agent.id}，角色：${agent.role}\n问题：${question}\n共享权威上下文：\n${challengeContext}\n` +
-            `修订你的立场并标记关键争议。只输出 JSON：` +
-            `{"position":"修订意见","disputes":[{"topic":"争议主题","stance":"你的明确立场","confidence":"low|medium|high"}]}${this.guidanceText()}`,
+          prompt: revisionPrompt(agent, challengeContext),
           parse: parseRevision,
         });
         revisions.set(agent.id, output.value);
@@ -124,21 +131,23 @@ export class StructuredController {
       const disputeTopics = this.findDisputes(revisions);
       await this.pauseAt("disputes", disputeTopics.length ? disputeTopics.join("\n") : "未检测到关键立场冲突");
 
-      const revisionContext = await this.context.snapshot(question);
+      const convergencePrompt = (agent: DeliberationAgent, sharedContext: string): string =>
+        `你是 ${agent.id}。围绕以下已识别争议进行唯一一次收敛回应：\n${disputeTopics.join("\n")}\n` +
+        `共享权威上下文：\n${sharedContext}\n` +
+        `明确可接受共识、仍不同意之处及所需证据。${this.guidanceText()}`;
+      const convergenceReserve = Math.max(...this.plan.participants.map((agent) => estimateTokens(convergencePrompt(agent, "")))) + 1;
+      const revisionContext = await this.context.snapshot(question, convergenceReserve);
       const convergence = disputeTopics.length
         ? await this.parallel("convergence", this.plan.participants, (agent) =>
-          `你是 ${agent.id}。围绕以下已识别争议进行唯一一次收敛回应：\n${disputeTopics.join("\n")}\n` +
-          `共享权威上下文：\n${revisionContext}\n` +
-          `明确可接受共识、仍不同意之处及所需证据。${this.guidanceText()}`,
+          convergencePrompt(agent, revisionContext),
         )
         : new Map<string, string>();
       this.context.addMany(this.plan.participants.filter((agent) => convergence.has(agent.id)).map((agent) =>
         [`争议收敛 · ${agent.id}`, convergence.get(agent.id)!] as const));
 
-      const evidence = await this.context.snapshot(question);
       const report = await new OutcomePipeline(this.runner, this.plan, this.context).run(
         question,
-        evidence,
+        "",
         () => this.guidanceText(),
         (draft) => this.pauseAt("draft", draft),
       );

@@ -35,6 +35,7 @@ import type {
   InvocationPresetRef,
 } from "../core/types.js";
 import { CheckpointMailbox, observerIsOnline, startObserverServer } from "../server/index.js";
+import { emitWarnings, writeCompletedResult } from "./output.js";
 
 const HELP = `mad - 本地多 Agent 审议工具（TypeScript 迁移版）
 
@@ -409,8 +410,8 @@ async function deliberate(args: readonly string[]): Promise<void> {
     cwd = await realpath(parsed.values.workspace);
     if (!(await stat(cwd)).isDirectory()) throw new MadError("USAGE", `工作目录不是目录：${cwd}`);
     workspace = { path: cwd, mode: "direct-read-only" };
-    process.stderr.write(`警告：所有审议 CLI 将直接只读访问完整工作目录：${cwd}\n`);
   }
+  const workspaceWarnings = workspace ? [`参与 CLI 已获完整目录只读授权：${workspace.path}`] : [];
   const defaultOrganizer = registry.defaults.generator;
   let organizer = defaultOrganizer;
   if (parsed.values.organizer) {
@@ -470,11 +471,13 @@ async function deliberate(args: readonly string[]): Promise<void> {
     await archive.create(baseManifest);
     archiveCreated = true;
     process.stderr.write(`审议已创建：${archive.path}\n`);
+    await emitWarnings(archive, workspaceWarnings);
     const organizerRunner = new InvocationRunner(
       registry, archive, limits.maxCalls, cwd, createAdapter, undefined, limits.globalConcurrency ?? 6,
     );
     organizerRunner.setSignal(interrupt.signal);
     organizerRunner.setTimeoutSeconds(limits.timeoutSeconds);
+    organizerRunner.setContextBudget(limits.contextBudget);
     const organizerService = new OrganizerService(registry, createAdapter, organizerRunner);
     process.stderr.write(`正在组局：${organizer.cli}/${organizer.preset}\n`);
     const proposed = await organizerService.propose({
@@ -510,11 +513,10 @@ async function deliberate(args: readonly string[]): Promise<void> {
       planConfirmation: parsed.values["auto-confirm-plan"] ? "auto-first-valid" : "interactive",
     });
     await archive.appendEvent("plan.confirmed", { plan: externalPlan(plan), preflighted: proposed.preflightedCombinations });
-    const warnings = [
-      ...(workspace ? [`参与 CLI 已获完整目录只读授权：${workspace.path}`] : []),
-      ...(sharedOriginWarning(plan) ? [sharedOriginWarning(plan)] : []),
-    ];
-    for (const warning of warnings) await archive.appendEvent("warning", { message: warning });
+    const sourceWarning = sharedOriginWarning(plan);
+    const sourceWarnings = sourceWarning ? [sourceWarning] : [];
+    const warnings = [...workspaceWarnings, ...sourceWarnings];
+    await emitWarnings(archive, sourceWarnings);
     const mailbox = new CheckpointMailbox(paths.runtime, id);
     const result = mode === "structured"
       ? await new StructuredController(
@@ -535,26 +537,7 @@ async function deliberate(args: readonly string[]): Promise<void> {
         undefined,
         interrupt.signal,
       ).run(question);
-    if (format === "json") {
-      process.stdout.write(`${JSON.stringify({
-        deliberation_id: id,
-        status: "completed",
-        mode,
-        report: result.report,
-        participants: plan.participants,
-        budget_usage: {
-          call_attempts: result.callAttempts,
-          max_calls: plan.limits.maxCalls,
-          timeout_seconds: plan.limits.timeoutSeconds,
-          context_budget: plan.limits.contextBudget,
-          global_concurrency: plan.limits.globalConcurrency ?? 6,
-        },
-        warnings,
-        archive_path: archive.path,
-      })}\n`);
-    } else {
-      process.stdout.write(`${result.report}\n`);
-    }
+    writeCompletedResult({ format, deliberationId: id, mode, result, plan, warnings, archivePath: archive.path });
     process.stderr.write(`审议档案：${archive.path}\n`);
   } catch (error) {
     if (archiveCreated) {
@@ -608,8 +591,11 @@ async function resume(args: readonly string[]): Promise<void> {
     if (manifest.workspace) {
       const canonical = await realpath(cwd);
       if (canonical !== cwd || !(await stat(canonical)).isDirectory()) throw new MadError("USAGE", `原工作目录不可用：${cwd}`);
-      process.stderr.write(`警告：恢复后将继续直接只读访问完整工作目录：${cwd}\n`);
     }
+    const workspaceWarnings = manifest.workspace
+      ? [`参与 CLI 已获完整目录只读授权：${manifest.workspace.path}`]
+      : [];
+    await emitWarnings(archive, workspaceWarnings, true);
     let plan = manifest.plan;
     if (!plan) {
       const planning = manifest.planning;
@@ -623,6 +609,7 @@ async function resume(args: readonly string[]): Promise<void> {
       );
       organizerRunner.setSignal(interrupt.signal);
       organizerRunner.setTimeoutSeconds(planning.limits.timeoutSeconds);
+      organizerRunner.setContextBudget(planning.limits.contextBudget);
       const organizerService = new OrganizerService(registry, createAdapter, organizerRunner);
       let generation = planning.generation;
       let candidate = planning.candidatePlan;
@@ -696,29 +683,19 @@ async function resume(args: readonly string[]): Promise<void> {
         undefined,
         interrupt.signal,
       ).run(manifest.question);
-    const warnings = [
-      ...(manifest.workspace ? [`参与 CLI 已获完整目录只读授权：${manifest.workspace.path}`] : []),
-      ...(sharedOriginWarning(plan) ? [sharedOriginWarning(plan)] : []),
-    ];
-    for (const warning of warnings) await archive.appendEvent("warning", { message: warning });
-    if (parsed.values.format === "json") {
-      process.stdout.write(`${JSON.stringify({
-        deliberation_id: id,
-        status: "completed",
-        mode: manifest.mode,
-        report: result.report,
-        participants: plan.participants,
-        budget_usage: {
-          call_attempts: result.callAttempts,
-          max_calls: plan.limits.maxCalls,
-          timeout_seconds: plan.limits.timeoutSeconds,
-          context_budget: plan.limits.contextBudget,
-          global_concurrency: plan.limits.globalConcurrency ?? 6,
-        },
-        warnings,
-        archive_path: archive.path,
-      })}\n`);
-    } else process.stdout.write(`${result.report}\n`);
+    const sourceWarning = sharedOriginWarning(plan);
+    const sourceWarnings = sourceWarning ? [sourceWarning] : [];
+    const warnings = [...workspaceWarnings, ...sourceWarnings];
+    await emitWarnings(archive, sourceWarnings, true);
+    writeCompletedResult({
+      format: parsed.values.format,
+      deliberationId: id,
+      mode: manifest.mode,
+      result,
+      plan,
+      warnings,
+      archivePath: archive.path,
+    });
     process.stderr.write(`审议档案：${archive.path}\n`);
   } catch (error) {
     const current = await archive.readState();

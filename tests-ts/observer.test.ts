@@ -40,7 +40,21 @@ describe("authenticated observer service", () => {
       },
     };
     await archive.create(manifest);
-    await mkdir(join(paths.deliberations, "broken"));
+    await archive.writeReport("# 报告\n\n| 项 | 值 |\n|---|---|\n| 安全 | <script>alert(1)</script> |");
+    const broken = join(paths.deliberations, "broken");
+    await mkdir(broken);
+    await Promise.all([
+      writeFile(join(broken, "manifest.json"), JSON.stringify({
+        schema_version: 1, id: "broken", createdAt: new Date().toISOString(), question: "坏档案",
+        mode: "unknown", interaction: "auto",
+      })),
+      writeFile(join(broken, "state.json"), JSON.stringify({
+        schema_version: 1, status: "running", updatedAt: new Date().toISOString(), callAttempts: 0,
+        guidance: [], pendingInvocations: {}, completedInvocations: {}, checkpointDecisions: {},
+      })),
+      writeFile(join(broken, "events.jsonl"), ""),
+      writeFile(join(broken, "transcript.jsonl"), ""),
+    ]);
     await mkdir(join(paths.runtime, "checkpoints"), { recursive: true });
     await writeFile(join(paths.runtime, "checkpoints", "d1.request.json"), JSON.stringify({
       checkpointId: "cp-1", kind: "independent", summary: "等待确认", actions: ["continue", "cancel"],
@@ -54,6 +68,12 @@ describe("authenticated observer service", () => {
       const list = await fetch(`http://127.0.0.1:${observer.port}/api/deliberations`, { headers: authorization });
       expect(list.status).toBe(200);
       expect(await list.json()).toMatchObject([{ id: "d1", status: "planning" }]);
+      expect((await fetch(`http://127.0.0.1:${observer.port}/missing`, { headers: authorization })).status).toBe(401);
+      expect((await fetch(`http://127.0.0.1:${observer.port}/api/missing`, { headers: authorization })).status).toBe(404);
+      const detail = await fetch(`http://127.0.0.1:${observer.port}/api/deliberations/d1`, { headers: authorization });
+      const detailBody = await detail.json() as { reportHtml: string };
+      expect(detailBody.reportHtml).toContain("<table>");
+      expect(detailBody.reportHtml).not.toContain("<script");
       const endpoint = `http://127.0.0.1:${observer.port}/api/checkpoints/d1/respond`;
       const first = await fetch(endpoint, {
         method: "POST", headers: { ...authorization, "Content-Type": "application/json" },
@@ -65,6 +85,10 @@ describe("authenticated observer service", () => {
         body: JSON.stringify({ checkpointId: "cp-1", action: "continue" }),
       });
       expect(second.status).toBe(409);
+      const malformed = await fetch(endpoint, {
+        method: "POST", headers: { ...authorization, "Content-Type": "application/json" }, body: "[]",
+      });
+      expect(malformed.status).toBe(400);
       const heartbeat = await readFile(join(paths.runtime, "server.json"), "utf8");
       expect(heartbeat).not.toContain(observer.token);
       expect(await observerIsOnline(paths.runtime)).toBe(true);

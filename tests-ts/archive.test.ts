@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ActiveDeliberationLock, ArchiveStore } from "../src/archive/store.js";
+import { parseArchiveEvent } from "../src/archive/schema.js";
 import type { DeliberationManifest, FrozenInvocation, InvocationResult } from "../src/core/types.js";
 
 function manifest(id: string): DeliberationManifest {
@@ -27,6 +28,10 @@ function manifest(id: string): DeliberationManifest {
 }
 
 describe("transparent archive", () => {
+  it("rejects structurally invalid archive events", () => {
+    expect(() => parseArchiveEvent({ id: "e1", at: "now", type: "" })).toThrow(/event.type/);
+  });
+
   it("rejects deliberation IDs that escape the archive root", () => {
     expect(() => new ArchiveStore("/tmp/mad-archives", "../../outside"))
       .toThrow(/审议 ID/);
@@ -135,5 +140,52 @@ describe("transparent archive", () => {
     }));
     await first.release();
     expect(await readFile(path, "utf8")).toContain("replacement-owner");
+  });
+
+  it("redacts nested secrets at the diagnostics persistence boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-archive-redaction-"));
+    const store = new ArchiveStore(root, "d1");
+    await store.create(manifest("d1"));
+    const environmentSecret = "test-secret-value-123456";
+    process.env.MAD_ARCHIVE_TEST_SECRET = environmentSecret;
+    const circular: Record<string, unknown> = { password: "plain-password" };
+    circular.self = circular;
+    try {
+      await store.appendDiagnostic({
+        authorization: "Bearer exposed-token-123456",
+        nested: { stderr: `token=${environmentSecret}`, circular },
+      });
+      const persisted = await readFile(join(store.path, "diagnostics.jsonl"), "utf8");
+      expect(persisted).not.toContain(environmentSecret);
+      expect(persisted).not.toContain("plain-password");
+      expect(persisted).not.toContain("exposed-token-123456");
+      expect(persisted).toContain("[REDACTED]");
+      expect(persisted).toContain("[CIRCULAR]");
+    } finally {
+      delete process.env.MAD_ARCHIVE_TEST_SECRET;
+    }
+  });
+
+  it("rejects invalid manifest and state values at the shared archive boundary", async () => {
+    const root = await mkdtemp(join(tmpdir(), "mad-archive-schema-"));
+    const store = new ArchiveStore(root, "d1");
+    await store.create(manifest("d1"));
+    const invalidManifest = JSON.parse(await readFile(join(store.path, "manifest.json"), "utf8")) as Record<string, unknown>;
+    invalidManifest.mode = "unknown";
+    await writeFile(join(store.path, "manifest.json"), JSON.stringify(invalidManifest));
+    await expect(store.readManifest()).rejects.toThrow(/manifest.mode/);
+
+    await store.writeManifest(manifest("d1"));
+    const validState = JSON.parse(await readFile(join(store.path, "state.json"), "utf8")) as Record<string, unknown>;
+    const invalidState = structuredClone(validState);
+    invalidState.status = "unknown";
+    await writeFile(join(store.path, "state.json"), JSON.stringify(invalidState));
+    await expect(store.readState()).rejects.toThrow(/state.status/);
+
+    validState.pendingCheckpoint = {
+      key: "structured:draft", checkpointId: "cp-1", kind: "draft", summary: "草稿", actions: "continue",
+    };
+    await writeFile(join(store.path, "state.json"), JSON.stringify(validState));
+    await expect(store.readState()).rejects.toThrow(/pendingCheckpoint.actions/);
   });
 });

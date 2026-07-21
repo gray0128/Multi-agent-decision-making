@@ -33,7 +33,8 @@ describe("interrupt recovery boundary", () => {
     };
     await archive.create(manifest);
     const adapter: CliAdapter = {
-      supportsProjectReadOnly: true, probe: vi.fn(), check: vi.fn(),
+      projectReadOnlyCapability: "runtime-canary", verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(), check: vi.fn(),
       invoke: vi.fn(({ signal }) => new Promise<never>((_, reject) => {
         if (signal?.aborted) return reject(new MadError("PAUSED", "已中止"));
         signal?.addEventListener("abort", () => reject(new MadError("PAUSED", "已中止")), { once: true });

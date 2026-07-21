@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import * as TOML from "@iarna/toml";
 import { MadError } from "../core/errors.js";
+import { SAFE_MAX_LIMITS } from "../core/limits.js";
 
 export const ADAPTER_IDS = ["codex", "claude", "reasonix", "grok", "pi", "codebuddy", "agy"] as const;
 export type AdapterId = (typeof ADAPTER_IDS)[number];
@@ -75,6 +76,12 @@ function positiveIntegerAt(value: unknown, path: string, fallback?: number): num
   return resolved as number;
 }
 
+function boundedPositiveIntegerAt(value: unknown, path: string, maximum: number, fallback?: number): number {
+  const resolved = positiveIntegerAt(value, path, fallback);
+  if (resolved > maximum) throw new MadError("CONFIG", `${path} 必须是 1 到 ${maximum} 之间的整数`);
+  return resolved;
+}
+
 function parsePreset(value: unknown, cliPath: string, adapter: AdapterId): InvocationPreset {
   const raw = objectAt(value, cliPath);
   assertKeys(raw, ["id", "model", "context_budget", "options"], cliPath);
@@ -111,7 +118,11 @@ function parsePreset(value: unknown, cliPath: string, adapter: AdapterId): Invoc
   return {
     id: idAt(raw.id, `${cliPath}.id`),
     model,
-    contextBudget: positiveIntegerAt(raw.context_budget, `${cliPath}.context_budget`),
+    contextBudget: boundedPositiveIntegerAt(
+      raw.context_budget,
+      `${cliPath}.context_budget`,
+      SAFE_MAX_LIMITS.contextBudget,
+    ),
     options,
   };
 }

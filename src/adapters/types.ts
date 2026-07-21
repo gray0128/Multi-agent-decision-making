@@ -23,10 +23,18 @@ export interface PreflightResult {
   readonly detail?: string;
 }
 
+export type ProjectReadOnlyCapability = "unsupported" | "runtime-canary";
+
+export interface ProjectReadOnlyVerification {
+  readonly verified: boolean;
+  readonly detail?: string;
+}
+
 export interface CliAdapter {
-  readonly supportsProjectReadOnly: boolean;
+  readonly projectReadOnlyCapability: ProjectReadOnlyCapability;
   probe(signal?: AbortSignal, cwd?: string): Promise<PreflightResult>;
   check(cwd: string, signal?: AbortSignal): Promise<PreflightResult>;
+  verifyProjectReadOnly(signal?: AbortSignal): Promise<ProjectReadOnlyVerification>;
   invoke(request: InvocationRequest): Promise<AdapterResult>;
 }
 
