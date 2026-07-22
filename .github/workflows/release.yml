@@ -71,7 +71,7 @@ jobs:
           npm pack --dry-run
           npm pack --pack-destination release
 
-          package_file="release/multi-agent-decision-${PACKAGE_VERSION}.tgz"
+          package_file="$GITHUB_WORKSPACE/release/multi-agent-decision-${PACKAGE_VERSION}.tgz"
           checksum_file="${package_file}.sha256"
           test -f "$package_file"
 
