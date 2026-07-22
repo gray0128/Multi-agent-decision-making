@@ -92,8 +92,9 @@ jobs:
         env:
           PACKAGE_FILE: ${{ steps.package.outputs.package_file }}
         run: |
-          npm install --global "$PACKAGE_FILE"
-          mad --help
+          smoke_prefix="$RUNNER_TEMP/mad-smoke"
+          npm install --global --prefix "$smoke_prefix" "$PACKAGE_FILE"
+          "$smoke_prefix/bin/mad" --help
 
       - name: Publish GitHub Release
         shell: bash

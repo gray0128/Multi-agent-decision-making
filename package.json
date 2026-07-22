@@ -1,6 +1,6 @@
 {
   "name": "multi-agent-decision",
-  "version": "0.2.0-dev.0",
+  "version": "0.2.0-dev.1",
   "description": "Local, auditable multi-agent deliberation orchestrator",
   "type": "module",
   "bin": {
