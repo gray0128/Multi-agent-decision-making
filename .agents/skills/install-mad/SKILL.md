@@ -1,11 +1,13 @@
 ---
 name: install-mad
-description: Install, package, initialize, configure, verify, upgrade, repair, or uninstall the TypeScript Multi Agent Decision (`mad`) CLI on macOS from a release npm tarball or source checkout. Use whenever a user asks to set up this project without cloning the repository, build or inspect a distributable `.tgz`, make `mad` available on PATH, create or repair `clis.toml`, validate or preflight AI CLI adapters, preserve an existing MAD installation while upgrading it, or remove the command and optionally its application data.
+description: Install and initialize the TypeScript Multi Agent Decision (`mad`) CLI on macOS from an existing release npm tarball or source checkout. Use when a user asks to make `mad` available on PATH, create or preserve the local `clis.toml`, configure detected AI CLI adapters, or verify that the local installation and initialization are usable.
 ---
 
 # Install Multi Agent Decision
 
 Install the current TypeScript `mad` CLI as a global npm package. Preserve configuration and deliberation archives, distinguish static validation from paid model-backed preflight, and report external AI CLI readiness separately from installation success.
+
+This skill is limited to work on the user's local machine: selecting an existing installation source, installing the command, resolving PATH, initializing local application data, configuring `clis.toml`, and verifying local readiness. It does not build distributable artifacts for release, change package versions, maintain repository release automation, create or push tags, publish GitHub Releases, upload assets, or perform general repository maintenance.
 
 ## Inspect before changing anything
 
@@ -77,34 +79,6 @@ npm install --global .
 ```
 
 Use `git clone --branch <tag-or-branch>` when the user requested one. For a commit, clone first and then check out the exact commit. Do not discard or overwrite an existing destination.
-
-## Build a release tarball
-
-Only when the user asks to produce a distributable package, use a clean source checkout and run:
-
-```bash
-npm ci
-npm run typecheck
-npm test
-npm run build
-npm pack --dry-run
-npm pack
-shasum -a 256 multi-agent-decision-VERSION.tgz > multi-agent-decision-VERSION.tgz.sha256
-```
-
-Confirm that the dry-run and produced tarball include `dist/cli/index.js`. Report the exact versioned filename and SHA-256. Do not call `npm publish`, create a remote release, or upload artifacts unless the user separately authorizes that external change.
-
-## Publish a repository release
-
-Use `.github/workflows/release.yml` when the user explicitly asks to publish a GitHub Release:
-
-1. Confirm that `package.json` and `package-lock.json` contain the same intended version.
-2. Commit and push the release inputs before tagging; preserve unrelated worktree changes.
-3. Create and push the exact tag `v<package version>`.
-4. Wait for the tag-triggered workflow to finish. It must test, build, inspect, install-smoke-test, and upload both the `.tgz` and `.sha256` assets.
-5. Verify the published Release tag, prerelease status, asset filenames, and checksum before reporting success.
-
-Versions containing a prerelease suffix such as `-dev.0` or `-rc.1` are published as GitHub prereleases. Do not push a tag or claim a Release exists until the user has authorized the external publication and the workflow has actually succeeded.
 
 ## Resolve PATH
 
@@ -180,31 +154,3 @@ Report:
 - whether a new terminal is required for PATH changes.
 
 Distinguish these states clearly: command installed, registry initialized, registry statically valid, and model-backed preflight ready.
-
-## Upgrade or repair
-
-Preserve `~/Library/Application Support/MultiAgentDecisionTS/`. Reinstalling the npm package must not reset `clis.toml` or remove deliberation archives.
-
-For a local checkout, inspect the worktree before pulling. Only update the checkout when the user asked, and use a fast-forward-only pull when its state is safe:
-
-```bash
-git status --short
-git pull --ff-only
-npm ci
-npm run build
-npm install --global .
-```
-
-Do not discard local changes. If the user wants to keep the checkout at its current revision, omit the pull and rebuild that revision. Prefer installing an exact newer release tarball when the user does not need a source checkout; repeat `npm install --global` with its exact path and verify any published checksum first.
-
-After an upgrade or repair, rerun `command -v mad`, `mad --help`, and `mad config validate`. Run `mad config check` only with the model-backed preflight consent described above. Do not rerun `mad init` on a healthy existing registry.
-
-## Uninstall
-
-Only when explicitly requested, remove the global command:
-
-```bash
-npm uninstall --global multi-agent-decision
-```
-
-Verify that the npm package entry is gone and explain that uninstalling the command leaves configuration and deliberation archives under the application directory. Delete that directory only through a separate explicit request after resolving and displaying the exact target, warning that deletion is destructive, and following the environment's destructive-action approval policy.

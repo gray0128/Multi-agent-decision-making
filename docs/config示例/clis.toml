@@ -1,10 +1,11 @@
-# mad init 只探测可执行文件，不猜测模型、思考等级或默认组局器。
-# executable 默认保存 PATH 中的命令名，避免 CLI 升级后版本目录失效。
-# 填写下列占位符后运行 mad config validate / mad config check。
+# 模型信息参考 ../各agent信息收集/models-dev核验.md（核验日期：2026-07-21）。
+# executable 使用 PATH 中的稳定命令名，避免 CLI 升级后版本目录失效。
+# context_budget 表示 MAD 可使用的上下文预算；当前 schema 上限为 1000000。
+# 本示例可通过 mad config validate；mad config check 会真实调用全部 preset，可能消耗额度。
 
 [defaults.generator]
-cli = "REPLACE_WITH_CLI_ID"
-preset = "REPLACE_WITH_PRESET_ID"
+cli = "codex"
+preset = "sol"
 
 [[clis]]
 id = "codex"
@@ -13,14 +14,23 @@ executable = "codex"
 timeout_seconds = 300
 max_concurrency = 1
 
+# GPT-5.6 Sol：模型规格 1050000 context / 128000 output；MAD 上限截为 1000000。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "sol"
+model = "gpt-5.6-sol"
+context_budget = 1000000
 
-# 可选：取消注释并选择思考等级。
-# [clis.presets.options]
-# reasoning_effort = "minimal|low|medium|high|xhigh"
+[clis.presets.options]
+reasoning_effort = "high"
+
+# GPT-5.6 Terra：模型规格 1050000 context / 128000 output；MAD 上限截为 1000000。
+[[clis.presets]]
+id = "terra"
+model = "gpt-5.6-terra"
+context_budget = 1000000
+
+[clis.presets.options]
+reasoning_effort = "high"
 
 [[clis]]
 id = "claude"
@@ -29,14 +39,39 @@ executable = "claude"
 timeout_seconds = 300
 max_concurrency = 1
 
+# 本机 haiku 路由到 MiniMax-M3；使用 512K 保证档。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "haiku"
+model = "haiku"
+context_budget = 512000
 
-# 可选：取消注释并选择 effort。
-# [clis.presets.options]
-# effort = "low|medium|high|xhigh|max"
+[clis.presets.options]
+effort = "high"
+
+# sonnet / opus / fable 是本机 MiniMax-M3[1M] 路由名，并非 Anthropic 模型 ID。
+[[clis.presets]]
+id = "sonnet"
+model = "sonnet"
+context_budget = 1000000
+
+[clis.presets.options]
+effort = "high"
+
+[[clis.presets]]
+id = "opus"
+model = "opus"
+context_budget = 1000000
+
+[clis.presets.options]
+effort = "high"
+
+[[clis.presets]]
+id = "fable"
+model = "fable"
+context_budget = 1000000
+
+[clis.presets.options]
+effort = "high"
 
 [[clis]]
 id = "reasonix"
@@ -45,10 +80,17 @@ executable = "reasonix"
 timeout_seconds = 300
 max_concurrency = 1
 
+# DeepSeek V4 Pro：1000000 context / 384000 output。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "deepseek-v4-pro"
+model = "deepseek/deepseek-v4-pro"
+context_budget = 1000000
+
+# DeepSeek V4 Flash：1000000 context / 384000 output。
+[[clis.presets]]
+id = "deepseek-v4-flash"
+model = "deepseek/deepseek-v4-flash"
+context_budget = 1000000
 
 [[clis]]
 id = "grok"
@@ -57,14 +99,14 @@ executable = "grok"
 timeout_seconds = 300
 max_concurrency = 1
 
+# Grok 4.5：500000 context；500000 output 目前仅由 models.dev 记录。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "grok-4-5"
+model = "grok-4.5"
+context_budget = 500000
 
-# 可选：取消注释并选择 effort。
-# [clis.presets.options]
-# effort = "low|medium|high|xhigh|max"
+[clis.presets.options]
+effort = "high"
 
 [[clis]]
 id = "pi"
@@ -73,14 +115,32 @@ executable = "pi"
 timeout_seconds = 300
 max_concurrency = 1
 
+# DeepSeek V4 Flash：1000000 context / 384000 output。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "deepseek-v4-flash"
+model = "deepseek-v4-flash"
+context_budget = 1000000
 
-# 可选：取消注释并选择 thinking。
-# [clis.presets.options]
-# thinking = "off|minimal|low|medium|high|xhigh|max"
+[clis.presets.options]
+thinking = "high"
+
+# DeepSeek V4 Pro：1000000 context / 384000 output。
+[[clis.presets]]
+id = "deepseek-v4-pro"
+model = "deepseek-v4-pro"
+context_budget = 1000000
+
+[clis.presets.options]
+thinking = "high"
+
+# MiniMax-M3 中国区路由：最高 1M、保证 512K；使用保守的 512K 预算。
+[[clis.presets]]
+id = "minimax-m3"
+model = "minimax-cn/MiniMax-M3"
+context_budget = 512000
+
+[clis.presets.options]
+thinking = "high"
 
 [[clis]]
 id = "codebuddy"
@@ -89,10 +149,19 @@ executable = "codebuddy"
 timeout_seconds = 300
 max_concurrency = 1
 
+# CodeBuddy 平台模型 ID；hy3 的 preview / 正式版映射仍待核实。
+# 已确认 context 为 256000；64000 output 仅直接适用于 models.dev 的 preview 条目。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "hy3"
+model = "hy3"
+context_budget = 256000
+
+# CodeBuddy 平台模型 ID；与规范模型 kimi-k3 的精确映射仍待核实。
+# Kimi K3 规格为 1048576 context / 131072 output；MAD 上限截为 1000000。
+[[clis.presets]]
+id = "kimi-k3-2"
+model = "kimi-k3-2"
+context_budget = 1000000
 
 [[clis]]
 id = "agy"
@@ -101,7 +170,9 @@ executable = "agy"
 timeout_seconds = 300
 max_concurrency = 1
 
+# AGY flash 已核验对应 Gemini 3.5 Flash：1048576 context / 65536 output。
+# MAD 上限截为 1000000。pro / flash_lite 的规范模型 ID 尚未核实，因此不写入可用 preset。
 [[clis.presets]]
-id = "default"
-model = "REPLACE_WITH_MODEL_ID"
-context_budget = 64000
+id = "flash"
+model = "flash"
+context_budget = 1000000
