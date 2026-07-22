@@ -12,20 +12,67 @@
 - 至少一个已经安装并完成认证的受支持 AI CLI；审议方案本身至少包含两个临时 Agent，它们可以使用不同 CLI，也可以基于同一可信调用预设承担不同角色；
 - macOS 为当前完成真实接管验收的平台。
 
-从源码开发：
+### 1.1 安装发布包（推荐）
+
+优先从 [GitHub Releases](https://github.com/gray0128/Multi-agent-decision-making/releases) 下载 `multi-agent-decision-VERSION.tgz` 及同名 `.sha256`，然后使用绝对路径安装：
 
 ```bash
-npm install
+npm install --global /absolute/path/to/multi-agent-decision-VERSION.tgz
+command -v mad
+mad --help
+```
+
+这种方式不需要 clone 仓库，也不依赖本地 TypeScript 构建工具。npm 仍可能从 registry 下载运行时依赖，因此 `.tgz` 不是完全离线安装包。如果发布页同时提供 SHA-256 文件，安装前先核对校验和。
+
+```bash
+cd /absolute/path/to/download-directory
+shasum -a 256 -c multi-agent-decision-VERSION.tgz.sha256
+```
+
+### 1.2 从源码开发
+
+```bash
+npm ci
 npm run typecheck
 npm test
 npm run build
 node dist/cli/index.js --help
 ```
 
-安装打包后的 npm 包时，命令入口为 `mad`。在仓库中开发可用：
+在仓库中开发可用：
 
 ```bash
 MAD_HOME="$PWD/.mad-ts-local" node dist/cli/index.js <command>
+```
+
+从已构建的 checkout 安装全局命令：
+
+```bash
+npm install --global .
+mad --help
+```
+
+### 1.3 生成发布包
+
+发布者应在干净 checkout 中完成验证和构建后再打包：
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
+npm pack
+shasum -a 256 multi-agent-decision-VERSION.tgz > multi-agent-decision-VERSION.tgz.sha256
+```
+
+`npm pack` 会生成带版本号的 `.tgz`；发布前用 `npm pack --dry-run` 确认清单包含 `dist/cli/index.js`、`package.json` 和 README。将 tarball 及其 SHA-256 一起上传到发布页。
+
+仓库的 [GitHub Actions 发布流水线](.github/workflows/release.yml) 在推送 `v<package.json version>` 标签时自动执行上述验证，创建 GitHub Release，并上传 `.tgz` 和 `.sha256`。`package.json` 与 `package-lock.json` 版本必须与标签完全一致；带预发布后缀的版本会发布为 prerelease。
+
+```bash
+version="$(node -p "require('./package.json').version")"
+git tag "v$version"
+git push origin "v$version"
 ```
 
 ## 2. 初始化和 CLI 注册表
@@ -37,7 +84,7 @@ MAD_HOME="$PWD/.mad-ts-local" node dist/cli/index.js init
 `mad init` 只完成以下工作：
 
 1. 创建私有的配置、档案和运行时目录；
-2. 在 `PATH` 中探测七种 CLI 及其可执行路径；
+2. 在 `PATH` 中探测七种 CLI，并在配置中保存稳定命令名，不绑定具体版本目录；
 3. 生成 `config/clis.toml` 骨架。
 
 已有配置默认不会被覆盖；`mad init --force` 会显式重建配置骨架，使用前应先备份。初始化不会猜测模型、思考等级或默认组局器。填写真实预设后运行：
@@ -267,6 +314,8 @@ npm test
 npm run build
 npm pack --dry-run
 ```
+
+生成可发布的安装包时使用 `npm pack`，并对产物生成 SHA-256；`--dry-run` 只验证打包清单，不产生 tarball。
 
 测试覆盖严格配置、七个适配器、固定组局、结构化和自由讨论、并发与上下文、透明档案、恢复和中断、观察服务认证、检查点竞争，以及 Markdown/JSON CLI 端到端契约。
 

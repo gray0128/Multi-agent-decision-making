@@ -1,0 +1,114 @@
+name: Release npm tarball
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Verify release version
+        id: version
+        shell: bash
+        run: |
+          package_version="$(node -p "require('./package.json').version")"
+          lock_version="$(node -p "require('./package-lock.json').version")"
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          if [[ "$GITHUB_REF_NAME" == "$tag_version" ]]; then
+            echo "Release tag must start with v: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          if [[ "$tag_version" != "$package_version" ]]; then
+            echo "Tag $GITHUB_REF_NAME does not match package version $package_version" >&2
+            exit 1
+          fi
+          if [[ "$lock_version" != "$package_version" ]]; then
+            echo "package-lock.json version $lock_version does not match package.json $package_version" >&2
+            exit 1
+          fi
+
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Verify source
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Build and inspect package
+        id: package
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p release
+          npm pack --dry-run
+          npm pack --pack-destination release
+
+          package_file="release/multi-agent-decision-${PACKAGE_VERSION}.tgz"
+          checksum_file="${package_file}.sha256"
+          test -f "$package_file"
+
+          contents="$(tar -tf "$package_file")"
+          grep -Fxq "package/dist/cli/index.js" <<< "$contents"
+          grep -Fxq "package/package.json" <<< "$contents"
+          grep -Fxq "package/README.md" <<< "$contents"
+
+          (
+            cd release
+            sha256sum "$(basename "$package_file")" > "$(basename "$checksum_file")"
+          )
+
+          echo "package_file=$package_file" >> "$GITHUB_OUTPUT"
+          echo "checksum_file=$checksum_file" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test packaged command
+        env:
+          PACKAGE_FILE: ${{ steps.package.outputs.package_file }}
+        run: |
+          npm install --global "$PACKAGE_FILE"
+          mad --help
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          PACKAGE_FILE: ${{ steps.package.outputs.package_file }}
+          CHECKSUM_FILE: ${{ steps.package.outputs.checksum_file }}
+        run: |
+          release_args=(--verify-tag --generate-notes)
+          if [[ "$PACKAGE_VERSION" == *-* ]]; then
+            release_args+=(--prerelease --latest=false)
+          fi
+
+          gh release create "$GITHUB_REF_NAME" \
+            "$PACKAGE_FILE" \
+            "$CHECKSUM_FILE" \
+            "${release_args[@]}"

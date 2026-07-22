@@ -1,6 +1,6 @@
 ---
 name: install-mad
-description: Install, initialize, configure, verify, upgrade, repair, or uninstall the TypeScript Multi Agent Decision (`mad`) CLI on macOS from a local checkout, the canonical Git repository, or an npm package tarball. Use whenever a user asks to set up this project on another computer, make `mad` available on PATH, create or repair `clis.toml`, validate or preflight AI CLI adapters, preserve an existing MAD installation while upgrading it, or remove the command and optionally its application data.
+description: Install, package, initialize, configure, verify, upgrade, repair, or uninstall the TypeScript Multi Agent Decision (`mad`) CLI on macOS from a release npm tarball or source checkout. Use whenever a user asks to set up this project without cloning the repository, build or inspect a distributable `.tgz`, make `mad` available on PATH, create or repair `clis.toml`, validate or preflight AI CLI adapters, preserve an existing MAD installation while upgrading it, or remove the command and optionally its application data.
 ---
 
 # Install Multi Agent Decision
@@ -30,8 +30,9 @@ If `mad` already exists, resolve its path and inspect the global package before 
 Use the first matching source:
 
 1. Use a user-specified `.tgz` npm package tarball when provided.
-2. Use a user-specified or current checkout when `package.json` declares `"name": "multi-agent-decision"`.
-3. Otherwise clone the canonical repository into a user-approved destination:
+2. Use an exact, user-approved tarball from the canonical [GitHub Releases](https://github.com/gray0128/Multi-agent-decision-making/releases) when one is available; verify its published checksum when provided.
+3. Use a user-specified or current checkout when `package.json` declares `"name": "multi-agent-decision"`.
+4. Otherwise clone the canonical repository into a user-approved destination:
    `https://github.com/gray0128/Multi-agent-decision-making.git`.
 
 Honor a requested tag, commit, or branch. Do not silently replace it with the latest revision. A source checkout must be built before global installation because `dist/` is generated and is not stored in Git; therefore, do not install directly from the Git URL with `npm install --global git+...`.
@@ -59,7 +60,9 @@ Install an absolute, explicitly resolved path:
 npm install --global /absolute/path/to/multi-agent-decision-VERSION.tgz
 ```
 
-Do not use an unresolved glob when more than one tarball could match. A release tarball must contain `dist/cli/index.js`; if provenance or contents are uncertain, inspect it with `npm pack --dry-run` from its source checkout or `tar -tf` before installation.
+Do not use an unresolved glob when more than one tarball could match. A release tarball must contain `package/dist/cli/index.js`, `package/package.json`, and `package/README.md`; inspect an existing tarball with `tar -tf`. `npm pack --dry-run` checks what a source checkout would package, but does not validate a previously built tarball.
+
+An npm tarball avoids cloning and local compilation, but npm may still download runtime dependencies from its registry. Do not describe it as fully offline unless its dependencies have been packaged and tested for offline installation.
 
 ### From the canonical repository
 
@@ -74,6 +77,34 @@ npm install --global .
 ```
 
 Use `git clone --branch <tag-or-branch>` when the user requested one. For a commit, clone first and then check out the exact commit. Do not discard or overwrite an existing destination.
+
+## Build a release tarball
+
+Only when the user asks to produce a distributable package, use a clean source checkout and run:
+
+```bash
+npm ci
+npm run typecheck
+npm test
+npm run build
+npm pack --dry-run
+npm pack
+shasum -a 256 multi-agent-decision-VERSION.tgz > multi-agent-decision-VERSION.tgz.sha256
+```
+
+Confirm that the dry-run and produced tarball include `dist/cli/index.js`. Report the exact versioned filename and SHA-256. Do not call `npm publish`, create a remote release, or upload artifacts unless the user separately authorizes that external change.
+
+## Publish a repository release
+
+Use `.github/workflows/release.yml` when the user explicitly asks to publish a GitHub Release:
+
+1. Confirm that `package.json` and `package-lock.json` contain the same intended version.
+2. Commit and push the release inputs before tagging; preserve unrelated worktree changes.
+3. Create and push the exact tag `v<package version>`.
+4. Wait for the tag-triggered workflow to finish. It must test, build, inspect, install-smoke-test, and upload both the `.tgz` and `.sha256` assets.
+5. Verify the published Release tag, prerelease status, asset filenames, and checksum before reporting success.
+
+Versions containing a prerelease suffix such as `-dev.0` or `-rc.1` are published as GitHub prereleases. Do not push a tag or claim a Release exists until the user has authorized the external publication and the workflow has actually succeeded.
 
 ## Resolve PATH
 
@@ -109,7 +140,7 @@ Before initialization, check whether the registry exists. Then run:
 mad init
 ```
 
-`mad init` creates private config, archive, and runtime directories; probes supported executable names on PATH; and writes a `clis.toml` skeleton. It refuses to overwrite an existing registry. Treat that refusal as data protection, not as a failed installation.
+`mad init` creates private config, archive, and runtime directories; probes supported executable names on PATH; and writes a `clis.toml` skeleton using stable command names rather than version-specific real paths. It refuses to overwrite an existing registry. Treat that refusal as data protection, not as a failed installation.
 
 Never run `mad init --force` unless the user explicitly requests registry regeneration and the existing `clis.toml` has first been copied to a clearly reported backup path. `--force` replaces the registry skeleton; it is not an installation repair command.
 
@@ -164,7 +195,7 @@ npm run build
 npm install --global .
 ```
 
-Do not discard local changes. If the user wants to keep the checkout at its current revision, omit the pull and rebuild that revision. For a new tarball, repeat `npm install --global` with its exact path.
+Do not discard local changes. If the user wants to keep the checkout at its current revision, omit the pull and rebuild that revision. Prefer installing an exact newer release tarball when the user does not need a source checkout; repeat `npm install --global` with its exact path and verify any published checksum first.
 
 After an upgrade or repair, rerun `command -v mad`, `mad --help`, and `mad config validate`. Run `mad config check` only with the model-backed preflight consent described above. Do not rerun `mad init` on a healthy existing registry.
 

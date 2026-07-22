@@ -1,4 +1,4 @@
 interface:
   display_name: "Install Multi Agent Decision"
-  short_description: "用 Node.js/npm 安装、配置、升级并验证 mad CLI"
+  short_description: "用 npm 打包、安装、配置并验证 mad CLI"
   default_prompt: "Use $install-mad to install and verify Multi Agent Decision on this Mac."
