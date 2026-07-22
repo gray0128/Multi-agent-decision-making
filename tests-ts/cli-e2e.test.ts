@@ -38,6 +38,22 @@ describe("mad CLI end to end", () => {
     await writeFile(config, `[defaults.generator]\ncli = "codex"\npreset = "test"\n\n[[clis]]\nid = "codex"\nadapter = "codex"\nexecutable = "${executable}"\ntimeout_seconds = 30\nmax_concurrency = 1\n\n[[clis.presets]]\nid = "test"\nmodel = "fake-model"\ncontext_budget = 64000\n`);
   }
 
+  it("stores a PATH-resolved command name in the initialized CLI registry", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-cli-init-"));
+    const bin = join(home, "bin");
+    const executable = join(bin, "codex");
+    await mkdir(bin, { recursive: true });
+    await writeFile(executable, "#!/bin/sh\necho 'codex-cli test'\n");
+    await chmod(executable, 0o755);
+
+    const result = await command(home, ["init"], { PATH: bin });
+
+    expect(result.code, result.stderr).toBe(0);
+    const registry = await readFile(join(home, "config", "clis.toml"), "utf8");
+    expect(registry).toContain('executable = "codex"');
+    expect(registry).not.toContain(executable);
+  });
+
   it("rejects recursive deliberation from a participant process", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-cli-recursive-"));
     await configure(home);

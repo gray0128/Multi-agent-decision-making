@@ -210,9 +210,10 @@ export function resolveInvocation(registry: CliRegistry, cliId: string, presetId
 
 export function buildConfigTemplate(
   installed: readonly AdapterId[],
-  executablePaths: Readonly<Partial<Record<AdapterId, string>>> = {},
+  detectedExecutables: Readonly<Partial<Record<AdapterId, string>>> = {},
 ): string {
   const header = `# mad init 只探测可执行文件，不猜测模型、思考等级或默认组局器。\n` +
+    `# executable 默认保存 PATH 中的命令名，避免 CLI 升级后版本目录失效。\n` +
     `# 填写下列占位符后运行 mad config validate / mad config check。\n\n` +
     `[defaults.generator]\ncli = "REPLACE_WITH_CLI_ID"\npreset = "REPLACE_WITH_PRESET_ID"\n`;
   if (!installed.length) return `clis = []\n\n${header}`;
@@ -224,7 +225,7 @@ export function buildConfigTemplate(
       : adapter === "pi"
       ? `\n# 可选：取消注释并选择 thinking。\n# [clis.presets.options]\n# thinking = "off|minimal|low|medium|high|xhigh|max"\n`
       : "";
-    const executable = (executablePaths[adapter] ?? adapter).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
+    const executable = (detectedExecutables[adapter] ?? adapter).replaceAll("\\", "\\\\").replaceAll('"', '\\"');
     return `[[clis]]\nid = "${adapter}"\nadapter = "${adapter}"\nexecutable = "${executable}"\ntimeout_seconds = 300\nmax_concurrency = 1\n\n` +
       `[[clis.presets]]\nid = "default"\nmodel = "REPLACE_WITH_MODEL_ID"\ncontext_budget = 64000\n${options}`;
   });

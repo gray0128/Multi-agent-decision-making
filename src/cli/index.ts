@@ -60,21 +60,21 @@ async function initialize(force: boolean): Promise<void> {
     ensurePrivateDirectory(paths.deliberations),
     ensurePrivateDirectory(paths.runtime),
   ]);
-  const executablePaths: Partial<Record<AdapterId, string>> = {};
+  const detectedExecutables: Partial<Record<AdapterId, string>> = {};
   const installedResults = await Promise.all(ADAPTER_IDS.map(async (adapter) => {
     try {
-      const executable = await findExecutable(adapter);
+      const executable = await findExecutableCommand(adapter);
       if (!executable) return null;
       const probe = adapter === "codex" ? ["--version"] : buildProbeCommand(adapter);
       const result = await runProcess(executable, probe, { cwd: process.cwd(), timeoutMs: 5_000 });
       if (result.exitCode !== 0) return null;
-      executablePaths[adapter] = executable;
+      detectedExecutables[adapter] = executable;
       return adapter;
     } catch { return null; }
   }));
   const installed = installedResults.filter((value): value is AdapterId => value !== null);
   try {
-    await writeFile(paths.config, buildConfigTemplate(installed, executablePaths), {
+    await writeFile(paths.config, buildConfigTemplate(installed, detectedExecutables), {
       encoding: "utf8",
       mode: 0o600,
       flag: force ? "w" : "wx",
@@ -93,12 +93,12 @@ async function ensurePrivateDirectory(path: string): Promise<void> {
   await chmod(path, 0o700);
 }
 
-async function findExecutable(name: string): Promise<string | null> {
+async function findExecutableCommand(name: string): Promise<string | null> {
   for (const directory of (process.env.PATH ?? "").split(delimiter).filter(Boolean)) {
     const candidate = join(directory, name);
     try {
       await access(candidate, constants.X_OK);
-      return await realpath(candidate);
+      return name;
     } catch { /* try next PATH entry */ }
   }
   return null;

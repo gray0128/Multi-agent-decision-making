@@ -1,0 +1,107 @@
+# mad init 只探测可执行文件，不猜测模型、思考等级或默认组局器。
+# executable 默认保存 PATH 中的命令名，避免 CLI 升级后版本目录失效。
+# 填写下列占位符后运行 mad config validate / mad config check。
+
+[defaults.generator]
+cli = "REPLACE_WITH_CLI_ID"
+preset = "REPLACE_WITH_PRESET_ID"
+
+[[clis]]
+id = "codex"
+adapter = "codex"
+executable = "codex"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
+
+# 可选：取消注释并选择思考等级。
+# [clis.presets.options]
+# reasoning_effort = "minimal|low|medium|high|xhigh"
+
+[[clis]]
+id = "claude"
+adapter = "claude"
+executable = "claude"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
+
+# 可选：取消注释并选择 effort。
+# [clis.presets.options]
+# effort = "low|medium|high|xhigh|max"
+
+[[clis]]
+id = "reasonix"
+adapter = "reasonix"
+executable = "reasonix"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
+
+[[clis]]
+id = "grok"
+adapter = "grok"
+executable = "grok"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
+
+# 可选：取消注释并选择 effort。
+# [clis.presets.options]
+# effort = "low|medium|high|xhigh|max"
+
+[[clis]]
+id = "pi"
+adapter = "pi"
+executable = "pi"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
+
+# 可选：取消注释并选择 thinking。
+# [clis.presets.options]
+# thinking = "off|minimal|low|medium|high|xhigh|max"
+
+[[clis]]
+id = "codebuddy"
+adapter = "codebuddy"
+executable = "codebuddy"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
+
+[[clis]]
+id = "agy"
+adapter = "agy"
+executable = "agy"
+timeout_seconds = 300
+max_concurrency = 1
+
+[[clis.presets]]
+id = "default"
+model = "REPLACE_WITH_MODEL_ID"
+context_budget = 64000
