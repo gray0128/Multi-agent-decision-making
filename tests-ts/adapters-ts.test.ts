@@ -50,6 +50,22 @@ describe("typed CLI adapters", () => {
     expect(pi.args).toEqual(expect.arrayContaining(["--print", "--thinking", "medium"]));
   });
 
+  it("maps a structured output schema to Claude without affecting ordinary calls", () => {
+    const schema = {
+      type: "object",
+      properties: { status: { type: "string", enum: ["blocked"] } },
+      required: ["status"],
+      additionalProperties: false,
+    } as const;
+    const structured = buildInvocationCommand(cli("claude"), preset, "prompt", schema);
+    const ordinary = buildInvocationCommand(cli("claude"), preset, "prompt");
+    const schemaIndex = structured.args.indexOf("--json-schema");
+
+    expect(schemaIndex).toBeGreaterThan(-1);
+    expect(structured.args[schemaIndex + 1]).toBe(JSON.stringify(schema));
+    expect(ordinary.args).not.toContain("--json-schema");
+  });
+
   it("extracts only public assistant text from JSON and JSONL outputs", () => {
     expect(publicText(JSON.stringify({ type: "result", result: "final" }))).toBe("final");
     expect(publicText([

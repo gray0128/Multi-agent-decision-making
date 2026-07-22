@@ -3,6 +3,7 @@ import type { CliConfig, InvocationPreset } from "./config.js";
 export interface InvocationRequest {
   readonly prompt: string;
   readonly cwd: string;
+  readonly jsonSchema?: Readonly<Record<string, unknown>>;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
 }

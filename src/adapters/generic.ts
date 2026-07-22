@@ -17,10 +17,15 @@ export function buildProbeCommand(adapter: CliConfig["adapter"]): readonly strin
   return ["--version"];
 }
 
-export function buildInvocationCommand(cli: CliConfig, preset: InvocationPreset, prompt: string): InvocationCommand {
+export function buildInvocationCommand(
+  cli: CliConfig,
+  preset: InvocationPreset,
+  prompt: string,
+  jsonSchema?: Readonly<Record<string, unknown>>,
+): InvocationCommand {
   const model = ["--model", preset.model];
   switch (cli.adapter) {
-    case "claude": return { args: ["-p", "--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep,WebSearch,WebFetch", "--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', ...(preset.options.effort ? ["--effort", preset.options.effort] : []), ...model], input: prompt };
+    case "claude": return { args: ["-p", "--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep,WebSearch,WebFetch", "--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', ...(jsonSchema ? ["--json-schema", JSON.stringify(jsonSchema)] : []), ...(preset.options.effort ? ["--effort", preset.options.effort] : []), ...model], input: prompt };
     case "reasonix": return { args: ["run", "--dir", ".", "--model", preset.model, "--max-steps", "3"], input: prompt };
     case "grok": return { args: ["--output-format", "json", "--permission-mode", "plan", "--no-subagents", "--no-memory", "--cwd", ".", ...(preset.options.effort ? ["--effort", preset.options.effort] : []), ...model, "--single", prompt] };
     case "pi": return { args: ["--mode", "json", "--print", "--no-session", "--no-approve", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls", ...(preset.options.thinking ? ["--thinking", preset.options.thinking] : []), ...model, prompt] };
@@ -76,7 +81,7 @@ export class GenericCliAdapter implements CliAdapter {
 
   public async invoke(request: InvocationRequest): Promise<AdapterResult> {
     if (process.env.MAD_PARTICIPANT === "1") throw new MadError("EXECUTION", "禁止从参与者进程递归调用 mad");
-    const command = buildInvocationCommand(this.cli, this.preset, request.prompt);
+    const command = buildInvocationCommand(this.cli, this.preset, request.prompt, request.jsonSchema);
     const result = await runProcess(this.cli.executable, command.args, {
       cwd: request.cwd,
       ...(command.input === undefined ? {} : { input: command.input }),
