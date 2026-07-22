@@ -53,11 +53,19 @@ function parseEvidence(text: string): ReadOnlyEvidence | null {
   const direct = parseEvidenceObject(trimmed);
   if (direct) return direct;
 
-  const candidates: ReadOnlyEvidence[] = [];
+  const fencedCandidates: ReadOnlyEvidence[] = [];
   for (const match of trimmed.matchAll(/```(?:json)?\s*([\s\S]*?)\s*```/gi)) {
     const candidate = parseEvidenceObject(match[1] ?? "");
-    if (candidate) candidates.push(candidate);
+    if (candidate) fencedCandidates.push(candidate);
   }
+
+  const inlineCandidates: ReadOnlyEvidence[] = [];
+  const outsideFences = trimmed.replace(/```(?:json)?\s*[\s\S]*?\s*```/gi, "");
+  for (const match of outsideFences.matchAll(/\{[^{}]*\}/g)) {
+    const candidate = parseEvidenceObject(match[0]);
+    if (candidate) inlineCandidates.push(candidate);
+  }
+  const candidates = [...fencedCandidates, ...inlineCandidates];
   return candidates.length === 1 ? candidates[0]! : null;
 }
 

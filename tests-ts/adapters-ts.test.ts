@@ -20,7 +20,7 @@ describe("typed CLI adapters", () => {
 
   it.each([
     ["claude", ["--permission-mode", "plan", "--no-session-persistence"]],
-    ["grok", ["--permission-mode", "plan", "--no-subagents", "--no-memory"]],
+    ["grok", ["--permission-mode", "plan", "--tools", "Read,Glob,Grep", "--no-subagents", "--no-memory"]],
     ["pi", ["--no-approve", "--no-session", "--no-extensions", "--tools", "read,grep,find,ls"]],
     ["codebuddy", ["--permission-mode", "plan", "--strict-mcp-config"]],
     ["agy", ["--mode", "plan", "--sandbox"]],
@@ -88,6 +88,11 @@ describe("typed CLI adapters", () => {
     ].join("\n");
     expect(publicText(raw)).toBe("");
     expect(publicError(raw)).toBe("401 invalid api key");
+  });
+
+  it("treats a zero-exit cancelled response as a public invocation error", () => {
+    const raw = JSON.stringify({ text: "partial", stopReason: "Cancelled" });
+    expect(publicError(raw)).toMatch(/调用已取消.*Cancelled/);
   });
 
   it("classifies a non-zero generic CLI exit without exposing its secret", () => {

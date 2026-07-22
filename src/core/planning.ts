@@ -227,6 +227,7 @@ export class OrganizerService {
     return `你是一次性组局 Agent。围绕当前问题生成本次审议的临时 Agent 与角色。\n` +
       `只能引用安全注册表中的 cli 与 preset ID，不得输出模型名、命令、可执行路径、CLI 参数、权限、环境变量、秘密或配置修改。\n` +
       `参与者为 2 到 ${request.limits.maxParticipants} 名；同一 cli/preset 可以创建多个不同角色实例，但它们共享模型来源。\n` +
+      `在角色适配且资源允许时，优先使用不同 cli 来源，避免全部角色共享组局器来源。\n` +
       `${request.mode === "free" ? "参与者不少于三名时，优先让主持 Agent 与报告 Agent 使用不同实例，但这不是硬性约束。\n" : ""}` +
       `模式：${request.mode}\n问题：\n${request.question}\n` +
       `资源限制：${JSON.stringify(request.limits)}\n组局器：${organizer.cli}/${organizer.preset}\n` +

@@ -74,25 +74,6 @@ context_budget = 1000000
 effort = "high"
 
 [[clis]]
-id = "reasonix"
-adapter = "reasonix"
-executable = "reasonix"
-timeout_seconds = 300
-max_concurrency = 1
-
-# DeepSeek V4 Pro：1000000 context / 384000 output。
-[[clis.presets]]
-id = "deepseek-v4-pro"
-model = "deepseek/deepseek-v4-pro"
-context_budget = 1000000
-
-# DeepSeek V4 Flash：1000000 context / 384000 output。
-[[clis.presets]]
-id = "deepseek-v4-flash"
-model = "deepseek/deepseek-v4-flash"
-context_budget = 1000000
-
-[[clis]]
 id = "grok"
 adapter = "grok"
 executable = "grok"
@@ -174,5 +155,5 @@ max_concurrency = 1
 # MAD 上限截为 1000000。pro / flash_lite 的规范模型 ID 尚未核实，因此不写入可用 preset。
 [[clis.presets]]
 id = "flash"
-model = "flash"
+model = "Gemini 3.5 Flash (High)"
 context_budget = 1000000

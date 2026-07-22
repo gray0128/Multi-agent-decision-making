@@ -157,7 +157,7 @@ MAD_HOME="$PWD/.mad-ts-local" node dist/cli/index.js deliberate \
   --workspace "$PWD"
 ```
 
-`--workspace` 是对规范化后完整目录的显式读取授权。项目不会被复制或制作快照；各适配器必须证明最低只读能力。Reasonix 当前没有可靠的只读开关，只能参与不带 `--workspace` 的纯文本审议。
+`--workspace` 是对规范化后完整目录的显式读取授权。项目不会被复制或制作快照；各适配器必须证明最低只读能力。组局候选严格来自 `clis.toml` 中存在的 CLI；如不希望某个 CLI 被选中，应从该配置中移除。Reasonix 当前没有可靠的只读开关，只适合按需配置在不带 `--workspace` 的纯文本审议环境中。
 
 ### 3.4 自动与机器输出
 
@@ -179,7 +179,7 @@ MAD_HOME="$PWD/.mad-ts-local" node dist/cli/index.js deliberate \
 
 | 参数 | 默认值 | 安全上限 | 含义 |
 |---|---:|---:|---|
-| `--max-participants N` | 4 | 8 | 临时审议 Agent 数量 |
+| `--max-participants N` | 5 | 8 | 临时审议 Agent 数量 |
 | `--max-calls N` | 60 | 100 | 模型调用尝试总数 |
 | `--max-discussion-windows N` | 6 | 12 | 自由讨论检查窗口数 |
 | `--timeout-seconds N` | 300 | 1800 | 单次调用超时秒数 |
@@ -197,7 +197,7 @@ MAD_HOME="$PWD/.mad-ts-local" node dist/cli/index.js deliberate \
   --organizer codex/sol-medium
 ```
 
-组局器只能看到注册表安全视图和资源上限，只能选择已有调用预设。交互终端中可以：
+组局器只能看到注册表安全视图和资源上限，只能选择已有调用预设；在角色适配且资源允许时会优先保持 CLI 来源多样性。交互终端中可以：
 
 - 回车确认；
 - 输入完整 JSON 修改参与者、临时角色、报告 Agent 或主持 Agent；

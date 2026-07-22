@@ -2,6 +2,10 @@ import { describe, expect, it } from "vitest";
 import { DEFAULT_LIMITS, resolveLimits } from "../src/core/limits.js";
 
 describe("three-layer resource limits", () => {
+  it("defaults to five temporary participants", () => {
+    expect(DEFAULT_LIMITS.maxParticipants).toBe(5);
+  });
+
   it("persists an explicit global concurrency within the safe maximum", () => {
     expect(resolveLimits({ globalConcurrency: 3 }).globalConcurrency).toBe(3);
     expect(() => resolveLimits({ globalConcurrency: 99 })).toThrow(/globalConcurrency/);

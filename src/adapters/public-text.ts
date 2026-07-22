@@ -74,6 +74,9 @@ export function publicText(raw: string): string {
 export function publicError(raw: string): string {
   const errors: string[] = [];
   for (const item of parseDocuments(raw).documents) {
+    if (["cancelled", "canceled"].includes(String(item.stopReason).toLowerCase())) {
+      errors.push(`调用已取消（stopReason: ${String(item.stopReason)}）`);
+    }
     if (typeof item.errorMessage === "string") errors.push(item.errorMessage);
     const error = item.error;
     if (typeof error === "string") errors.push(error);
@@ -83,6 +86,9 @@ export function publicError(raw: string): string {
     const message = item.message;
     if (typeof message === "object" && message !== null && typeof (message as { errorMessage?: unknown }).errorMessage === "string") {
       errors.push((message as { errorMessage: string }).errorMessage);
+    }
+    if (typeof message === "object" && message !== null && ["cancelled", "canceled"].includes(String((message as { stopReason?: unknown }).stopReason).toLowerCase())) {
+      errors.push(`调用已取消（stopReason: ${String((message as { stopReason?: unknown }).stopReason)}）`);
     }
   }
   return cleanPublicText([...new Set(errors.map((value) => value.trim()).filter(Boolean))].join("\n"));

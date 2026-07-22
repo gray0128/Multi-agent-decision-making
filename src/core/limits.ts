@@ -2,7 +2,7 @@ import type { ResourceLimits } from "./types.js";
 import { MadError } from "./errors.js";
 
 export const DEFAULT_LIMITS: ResourceLimits = {
-  maxParticipants: 4,
+  maxParticipants: 5,
   maxCalls: 60,
   maxDiscussionWindows: 6,
   timeoutSeconds: 300,

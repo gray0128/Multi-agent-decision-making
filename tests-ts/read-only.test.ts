@@ -38,12 +38,42 @@ describe("project read-only runtime canary", () => {
     await expect(verifyReadOnlyWithCanary(invoke)).resolves.toMatchObject({ verified: true });
   });
 
+  it("accepts one strict inline JSON evidence object after explanatory text", async () => {
+    const invoke = vi.fn(async ({ cwd }: { cwd: string }) => {
+      const nonce = await readFile(`${cwd}/readable.txt`, "utf8");
+      return {
+        text: `写工具不可用。${JSON.stringify({ read_nonce: nonce, write_result: "blocked" })}`,
+        durationMs: 1,
+        diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
+      };
+    });
+
+    await expect(verifyReadOnlyWithCanary(invoke)).resolves.toMatchObject({ verified: true });
+  });
+
   it("fails closed when multiple valid evidence blocks are returned", async () => {
     const invoke = vi.fn(async ({ cwd }: { cwd: string }) => {
       const nonce = await readFile(`${cwd}/readable.txt`, "utf8");
       const evidence = JSON.stringify({ read_nonce: nonce, write_result: "blocked" });
       return {
         text: `\`\`\`json\n${evidence}\n\`\`\`\n\n\`\`\`json\n${evidence}\n\`\`\``,
+        durationMs: 1,
+        diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
+      };
+    });
+
+    await expect(verifyReadOnlyWithCanary(invoke)).resolves.toMatchObject({
+      verified: false,
+      detail: expect.stringMatching(/证据 JSON/),
+    });
+  });
+
+  it("fails closed when fenced and inline evidence are both present", async () => {
+    const invoke = vi.fn(async ({ cwd }: { cwd: string }) => {
+      const nonce = await readFile(`${cwd}/readable.txt`, "utf8");
+      const evidence = JSON.stringify({ read_nonce: nonce, write_result: "blocked" });
+      return {
+        text: `\`\`\`json\n${evidence}\n\`\`\`\n${evidence}`,
         durationMs: 1,
         diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
       };
