@@ -8,11 +8,46 @@ import type { DeliberationManifest } from "../src/core/types.js";
 import { startObserverServer } from "../src/server/observer.js";
 import { observerIsOnline } from "../src/server/mailbox.js";
 import { launchObserverPage } from "../src/server/launch.js";
-import { APP_JS } from "../src/web/index.js";
+import { APP_JS, INDEX_HTML, STYLES_CSS, WEB_ASSET_VERSION } from "../src/web/index.js";
 
 describe("authenticated observer service", () => {
   it("serves browser JavaScript that parses successfully", () => {
     expect(() => new Function(APP_JS)).not.toThrow();
+  });
+
+  it("ships the compact archive layout and table treatment", () => {
+    expect(WEB_ASSET_VERSION).toBe(2);
+    expect(INDEX_HTML).toContain('id="toggle-index"');
+    expect(STYLES_CSS).toContain("--content-size:15px");
+    expect(STYLES_CSS).toContain(".archive-layout");
+    expect(STYLES_CSS).toContain(".anchor-rail");
+    expect(STYLES_CSS).toContain(".table-scroll");
+    expect(STYLES_CSS).toContain("position:sticky");
+  });
+
+  it("separates agent content from programmatic flow without requiring model changes", () => {
+    expect(APP_JS).toContain("processStages=new Set");
+    expect(APP_JS).toContain("process-output");
+    expect(APP_JS).toContain("body-output");
+    expect(APP_JS).toContain("运行信息");
+    expect(APP_JS).toContain("record.logicalCallId");
+    expect(APP_JS).toContain("r.contentHtml");
+  });
+
+  it("builds timeline anchors from existing transcript and event fields", () => {
+    expect(APP_JS).toContain("function timelineHtml(data)");
+    expect(APP_JS).toContain("r.id||r.logicalCallId");
+    expect(APP_JS).toContain("anchorId('event',e.id,index)");
+    expect(APP_JS).toContain("IntersectionObserver");
+    expect(APP_JS).toContain("显示流程");
+    expect(APP_JS).toContain("archiveHash(targetId)");
+    expect(APP_JS).toContain("initialArchive=fragment.get('archive')");
+  });
+
+  it("omits the outcome section when the archive has no report", () => {
+    expect(APP_JS).toContain("hasOutcome=Boolean(data.report?.trim())");
+    expect(APP_JS).toContain("const outcomeSection=hasOutcome?");
+    expect(APP_JS).not.toContain("尚未生成最终报告");
   });
 
   it("opens the authenticated observer URL after starting the service", async () => {
