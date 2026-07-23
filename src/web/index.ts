@@ -38,7 +38,7 @@ const shortStamp=value=>{try{return new Intl.DateTimeFormat('zh-CN',{month:'2-di
 const anchorId=(prefix,value,index=0)=>prefix+'-'+String(value||index).replace(/[^a-zA-Z0-9_-]/g,'-');
 const stageLabels={planning:'候选方案规划',independent:'独立陈述',challenge:'质疑补充',revision:'立场修订',convergence:'争议收敛',discussion_speech:'讨论发言',moderator_coverage:'主持覆盖规划',moderator_window:'主持窗口判断',context_summary:'上下文整理',report_draft:'成果草稿',review:'成果审核',report_final:'成果定稿'};
 const stageLabel=stage=>stageLabels[stage]||stage||'Agent 输出';
-const processStages=new Set(['planning','moderator_coverage','moderator_window','context_summary','report_draft','review','report_final']);
+const processStages=new Set(['planning','moderator_coverage','moderator_window','context_summary','report_final']);
 const isProcessStage=stage=>processStages.has(stage);
 const modeLabel=mode=>mode==='free'?'自由讨论':'结构化审议';
 const archiveHash=anchor=>'#archive='+encodeURIComponent(selected)+(anchor?'&anchor='+encodeURIComponent(anchor):'');
