@@ -88,6 +88,28 @@ describe("authenticated observer service", () => {
     expect(html).toContain("流程 · 候选方案规划");
   });
 
+  it("keeps report drafts and reviews expanded and visible in the default timeline", () => {
+    const ui = loadObserverUiTestApi();
+    const records = [
+      { id: "draft-1", stage: "report_draft", agentId: "reporter", at: "2026-07-23T10:02:00Z", contentHtml: "<p>成果草稿</p>" },
+      { id: "review-1", stage: "review", agentId: "reviewer", at: "2026-07-23T10:03:00Z", contentHtml: "<p>审核意见</p>" },
+    ];
+
+    const transcriptHtml = ui.transcriptHtml(records);
+    expect(transcriptHtml).toContain('id="output-draft-1" class="transcript-entry body-output"');
+    expect(transcriptHtml).toContain('id="output-review-1" class="transcript-entry body-output"');
+    expect(transcriptHtml).not.toContain("查看程序化内容");
+
+    const timelineHtml = ui.timelineHtml({
+      manifest: { createdAt: "2026-07-23T10:00:00Z" },
+      state: {}, checkpoint: null, report: "", transcript: records, events: [],
+    });
+    expect(timelineHtml).toContain('class="timeline-item " href="#archive=&amp;anchor=output-draft-1"');
+    expect(timelineHtml).toContain('class="timeline-item " href="#archive=&amp;anchor=output-review-1"');
+    expect(timelineHtml).toContain("成果草稿");
+    expect(timelineHtml).toContain("成果审核");
+  });
+
   it("renders timeline anchors and binds a streamed event for navigation", () => {
     let insertedEvent = "";
     let insertedTimeline = "";
