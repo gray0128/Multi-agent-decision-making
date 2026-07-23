@@ -12,5 +12,6 @@ export function redactAdapterDiagnostic(value: string): string {
       redacted = redacted.replaceAll(secret, "[REDACTED]");
     }
   }
-  return redacted.slice(0, 4_000).trim();
+  if (redacted.length <= 4_000) return redacted.trim();
+  return `${redacted.slice(0, 2_000).trimEnd()}\n…[诊断中段已截断]…\n${redacted.slice(-2_000).trimStart()}`.trim();
 }

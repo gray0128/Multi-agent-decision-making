@@ -110,6 +110,11 @@ describe("StructuredController", () => {
     expect(result.disputes).toEqual(["迁移时机"]);
     expect(result.callAttempts).toBe(11);
     expect(maximumActive).toBe(1); // 同一 CLI 的所有角色和预设共享限流器
+    const revisionRequests = vi.mocked(adapter.invoke).mock.calls
+      .map(([request]) => request)
+      .filter((request) => request.prompt.includes("只输出 JSON"));
+    expect(revisionRequests).toHaveLength(2);
+    expect(revisionRequests.every((request) => request.jsonSchema?.type === "object")).toBe(true);
     expect(prompts.some((prompt) => prompt.includes("不得把这些角色的一致意见描述为独立模型交叉验证"))).toBe(true);
     const reviewPrompt = prompts.find((prompt) => prompt.includes("检查是否忠实反映"));
     expect(reviewPrompt).toContain("独立陈述");

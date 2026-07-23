@@ -4,6 +4,7 @@ export interface InvocationRequest {
   readonly prompt: string;
   readonly cwd: string;
   readonly jsonSchema?: Readonly<Record<string, unknown>>;
+  readonly boundedJsonOutput?: boolean;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
 }

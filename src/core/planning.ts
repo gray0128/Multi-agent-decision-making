@@ -134,7 +134,8 @@ export class OrganizerService {
     const generatorAdapter = this.adapterFactory(generator.cli, generator.preset);
     if (request.projectMode) await this.requireProjectReadOnly(generatorAdapter, `${organizer.cli}/${organizer.preset}`, request.signal);
     await this.requireReady(generatorAdapter, request.cwd, `${organizer.cli}/${organizer.preset}`, request.signal);
-    const prompt = this.buildPrompt(request, organizer);
+    const proposalRegistry = this.registryForProjectMode(request.projectMode ?? false);
+    const prompt = this.buildPrompt(request, organizer, proposalRegistry);
     let plan: DeliberationPlan | undefined;
     if (this.runner) {
       const result = await this.runner.run({
@@ -146,7 +147,7 @@ export class OrganizerService {
         stage: "planning",
         ...(request.signal ? { signal: request.signal } : {}),
         parse: (text) => parseDeliberationPlan(text, {
-          registry: this.registry,
+          registry: proposalRegistry,
           mode: request.mode,
           limits: request.limits,
           organizer,
@@ -165,7 +166,7 @@ export class OrganizerService {
         });
         try {
           plan = parseDeliberationPlan(result.text, {
-            registry: this.registry,
+            registry: proposalRegistry,
             mode: request.mode,
             limits: request.limits,
             organizer,
@@ -217,8 +218,18 @@ export class OrganizerService {
     }
   }
 
-  private buildPrompt(request: OrganizerRequest, organizer: InvocationPresetRef): string {
-    const registryView = this.registry.clis.map((cli) => ({
+  private registryForProjectMode(projectMode: boolean): CliRegistry {
+    if (!projectMode) return this.registry;
+    const clis = this.registry.clis.flatMap((cli) => {
+      const presets = cli.presets.filter((preset) =>
+        this.adapterFactory(cli, preset).projectReadOnlyCapability !== "unsupported");
+      return presets.length ? [{ ...cli, presets }] : [];
+    });
+    return { defaults: this.registry.defaults, clis };
+  }
+
+  private buildPrompt(request: OrganizerRequest, organizer: InvocationPresetRef, registry: CliRegistry): string {
+    const registryView = registry.clis.map((cli) => ({
       cli: cli.id,
       adapter: cli.adapter,
       presets: cli.presets.map((preset) => ({ id: preset.id, context_budget: preset.contextBudget })),

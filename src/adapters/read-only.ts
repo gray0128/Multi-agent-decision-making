@@ -79,30 +79,43 @@ export async function verifyReadOnlyWithCanary(
   const nonce = randomUUID();
   try {
     await writeFile(readablePath, nonce, { mode: 0o600, flag: "wx" });
-    const result = await invoke({
-      cwd: directory,
-      jsonSchema: READ_ONLY_EVIDENCE_SCHEMA,
-      ...(signal ? { signal } : {}),
-      prompt: "这是项目只读能力验证。必须实际使用可用工具完成两步：" +
-        "先读取当前目录 readable.txt；再尝试创建 must-not-exist.txt 并写入相同内容。" +
-        "不要修改其他文件。最后只输出 JSON：" +
-        '{"read_nonce":"实际读取值","write_result":"blocked|succeeded"}。' +
-        "若没有写工具或写入被拒绝，write_result 必须为 blocked。",
-    });
-    if (await exists(forbiddenPath)) {
-      return { verified: false, detail: "只读 canary 检测到写入成功" };
+    let evidenceFailure = "";
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      let result: AdapterResult;
+      try {
+        result = await invoke({
+          cwd: directory,
+          boundedJsonOutput: true,
+          jsonSchema: READ_ONLY_EVIDENCE_SCHEMA,
+          ...(signal ? { signal } : {}),
+          prompt: "这是项目只读能力验证。必须实际使用可用工具完成两步：" +
+            "先读取当前目录 readable.txt；再尝试创建 must-not-exist.txt 并写入相同内容。" +
+            "不要修改其他文件。最后只输出 JSON：" +
+            '{"read_nonce":"实际读取值","write_result":"blocked|succeeded"}。' +
+            "若没有写工具或写入被拒绝，write_result 必须为 blocked。",
+        });
+      } catch (error) {
+        if (attempt < 2 && error instanceof Error && /未返回公开文本/.test(error.message)) continue;
+        throw error;
+      }
+      if (await exists(forbiddenPath)) {
+        return { verified: false, detail: "只读 canary 检测到写入成功" };
+      }
+      const evidence = parseEvidence(result.text);
+      if (!evidence) {
+        evidenceFailure = "只读 canary 响应不是唯一、有效的证据 JSON";
+        continue;
+      }
+      if (evidence.read_nonce !== nonce) {
+        evidenceFailure = "只读 canary 读取的随机校验值不匹配";
+        continue;
+      }
+      if (evidence.write_result !== "blocked") {
+        return { verified: false, detail: "只读 canary 未证明写操作被阻断" };
+      }
+      return { verified: true, detail: "随机读取成功且隔离目录写入被阻断" };
     }
-    const evidence = parseEvidence(result.text);
-    if (!evidence) {
-      return { verified: false, detail: "只读 canary 响应不是唯一、有效的证据 JSON" };
-    }
-    if (evidence.read_nonce !== nonce) {
-      return { verified: false, detail: "只读 canary 读取的随机校验值不匹配" };
-    }
-    if (evidence.write_result !== "blocked") {
-      return { verified: false, detail: "只读 canary 未证明写操作被阻断" };
-    }
-    return { verified: true, detail: "随机读取成功且隔离目录写入被阻断" };
+    return { verified: false, detail: evidenceFailure };
   } catch (error) {
     return {
       verified: false,

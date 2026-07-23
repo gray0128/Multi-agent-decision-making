@@ -126,4 +126,39 @@ describe("fixed organizer", () => {
     await expect(new OrganizerService(reasonixRegistry, () => adapter).preflightPlan(plan, process.cwd(), undefined, true))
       .rejects.toThrow(/禁止项目模式/);
   });
+
+  it("does not expose unsupported adapters to the project-mode organizer", async () => {
+    const projectRegistry: CliRegistry = {
+      defaults: registry.defaults,
+      clis: [...registry.clis, {
+        id: "agy", adapter: "agy", executable: "agy", timeoutSeconds: 300, maxConcurrency: 1,
+        presets: [{ id: "flash", model: "flash-model", contextBudget: 64_000, options: {} }],
+      }],
+    };
+    const codexAdapter: CliAdapter = {
+      projectReadOnlyCapability: "runtime-canary",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: true })),
+      probe: vi.fn(),
+      check: vi.fn(async () => ({ ready: true })),
+      invoke: vi.fn(async () => ({
+        text: structuredPayload,
+        durationMs: 1,
+        diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
+      })),
+    };
+    const unsupportedAdapter: CliAdapter = {
+      projectReadOnlyCapability: "unsupported",
+      verifyProjectReadOnly: vi.fn(async () => ({ verified: false })),
+      probe: vi.fn(), check: vi.fn(), invoke: vi.fn(),
+    };
+    const factory = vi.fn((cli) => cli.id === "agy" ? unsupportedAdapter : codexAdapter);
+
+    await new OrganizerService(projectRegistry, factory).propose({
+      question: "如何迁移？", mode: "structured", limits: DEFAULT_LIMITS, cwd: process.cwd(), projectMode: true,
+    });
+
+    const organizerPrompt = vi.mocked(codexAdapter.invoke).mock.calls[0]?.[0].prompt ?? "";
+    expect(organizerPrompt).not.toContain('"cli": "agy"');
+    expect(unsupportedAdapter.verifyProjectReadOnly).not.toHaveBeenCalled();
+  });
 });

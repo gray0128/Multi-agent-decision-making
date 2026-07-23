@@ -5,6 +5,11 @@ import type { AdapterResult, CliAdapter, InvocationRequest, PreflightResult } fr
 import { verifyReadOnlyWithCanary } from "./read-only.js";
 import { redactAdapterDiagnostic } from "./redact.js";
 
+export function codexParticipantPrompt(prompt: string): string {
+  return "这是 MAD 内部的一次性参与者调用。不要调用 mad，不要使用 deliberate-with-mad 或 install-mad skill，" +
+    "不要启动子审议或委派其他 Agent；请直接使用当前只读工具完成所分配角色并返回答案。\n\n" + prompt;
+}
+
 export class CodexAdapter implements CliAdapter {
   public readonly projectReadOnlyCapability = "runtime-canary" as const;
   public constructor(
@@ -72,7 +77,7 @@ export class CodexAdapter implements CliAdapter {
     args.push("-");
     const result = await runProcess(this.cli.executable, args, {
       cwd: request.cwd,
-      input: request.prompt,
+      input: codexParticipantPrompt(request.prompt),
       timeoutMs: request.timeoutMs ?? this.cli.timeoutSeconds * 1_000,
       participant: true,
       ...(request.signal ? { signal: request.signal } : {}),

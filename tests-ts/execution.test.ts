@@ -47,12 +47,22 @@ describe("InvocationRunner", () => {
         .mockResolvedValueOnce({ text: '{"ok":true}', durationMs: 1, diagnostic: { executable: "fake", exitCode: 0, stderr: "" } }),
     };
     const runner = new InvocationRunner(registry, archive, 20, process.cwd(), () => adapter);
+    const schema = {
+      type: "object",
+      properties: { ok: { type: "boolean" } },
+      required: ["ok"],
+      additionalProperties: false,
+    } as const;
     const output = await runner.run({
       id: "schema", kind: "contribution", agentId: "a", invocation: registry.defaults.generator,
-      prompt: "prompt", stage: "revision", parse: (text) => JSON.parse(text) as { ok: boolean },
+      prompt: "prompt", stage: "revision", jsonSchema: schema, parse: (text) => JSON.parse(text) as { ok: boolean },
     });
     expect(output.value).toEqual({ ok: true });
     expect(adapter.invoke).toHaveBeenCalledTimes(2);
+    expect(adapter.invoke).toHaveBeenCalledWith(expect.objectContaining({
+      jsonSchema: schema,
+      prompt: expect.stringMatching(/严格匹配.*JSON Schema/s),
+    }));
   });
 
   it("rejects an oversized prompt before invoking the CLI", async () => {

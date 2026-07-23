@@ -22,6 +22,28 @@ interface Revision {
   readonly disputes: readonly { readonly topic: string; readonly stance: string; readonly confidence: "low" | "medium" | "high" }[];
 }
 
+const REVISION_SCHEMA = {
+  type: "object",
+  properties: {
+    position: { type: "string" },
+    disputes: {
+      type: "array",
+      items: {
+        type: "object",
+        properties: {
+          topic: { type: "string" },
+          stance: { type: "string" },
+          confidence: { type: "string", enum: ["low", "medium", "high"] },
+        },
+        required: ["topic", "stance", "confidence"],
+        additionalProperties: false,
+      },
+    },
+  },
+  required: ["position", "disputes"],
+  additionalProperties: false,
+} as const;
+
 export interface StructuredResult {
   readonly report: string;
   readonly disputes: readonly string[];
@@ -120,6 +142,7 @@ export class StructuredController {
           invocation: agent.invocation,
           stage: "revision",
           prompt: revisionPrompt(agent, challengeContext),
+          jsonSchema: REVISION_SCHEMA,
           parse: parseRevision,
         });
         revisions.set(agent.id, output.value);

@@ -62,6 +62,7 @@ export interface LogicalInvocation<T> {
   readonly invocation: InvocationPresetRef;
   readonly prompt: string;
   readonly stage: string;
+  readonly jsonSchema?: Readonly<Record<string, unknown>>;
   readonly parse?: (text: string) => T;
   readonly signal?: AbortSignal;
 }
@@ -103,7 +104,10 @@ export class InvocationRunner {
 
   public async run<T = string>(call: LogicalInvocation<T>): Promise<LogicalInvocationOutput<T>> {
     const resolved = resolveInvocation(this.registry, call.invocation.cli, call.invocation.preset);
-    const inputTokens = estimateTokens(call.prompt);
+    const prompt = call.jsonSchema
+      ? `${call.prompt}\n\n强制输出协议：最终公开响应必须严格匹配以下 JSON Schema：${JSON.stringify(call.jsonSchema)}。只输出一个 JSON 对象，不要输出解释、前言或 Markdown 代码围栏。`
+      : call.prompt;
+    const inputTokens = estimateTokens(prompt);
     const contextBudget = Math.min(this.contextBudget ?? resolved.preset.contextBudget, resolved.preset.contextBudget);
     if (inputTokens > contextBudget) {
       throw new MadError(
@@ -115,7 +119,7 @@ export class InvocationRunner {
       logicalCallId: call.id,
       kind: call.kind,
       agentId: call.agentId,
-      prompt: call.prompt,
+      prompt,
       invocation: call.invocation,
       createdAt: new Date().toISOString(),
     };
@@ -143,8 +147,9 @@ export class InvocationRunner {
       try {
         const adapterResult = await this.scheduler.run(resolved.cli.id, resolved.cli.maxConcurrency, () =>
           adapter.invoke({
-            prompt: call.prompt,
+            prompt,
             cwd: this.cwd,
+            ...(call.jsonSchema ? { jsonSchema: call.jsonSchema } : {}),
             ...(this.timeoutSeconds ? { timeoutMs: Math.min(this.timeoutSeconds, resolved.cli.timeoutSeconds) * 1_000 } : {}),
             ...(signal ? { signal } : {}),
           }),

@@ -22,14 +22,29 @@ export function buildInvocationCommand(
   preset: InvocationPreset,
   prompt: string,
   jsonSchema?: Readonly<Record<string, unknown>>,
+  boundedJsonOutput = false,
 ): InvocationCommand {
   const model = ["--model", preset.model];
+  const schemaRule = jsonSchema
+    ? `最终公开响应必须严格匹配 JSON Schema：${JSON.stringify(jsonSchema)}。第一字符必须是 {，最后字符必须是 }；不要输出解释、前言或 Markdown 代码围栏。`
+    : undefined;
   switch (cli.adapter) {
-    case "claude": return { args: ["-p", "--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep,WebSearch,WebFetch", "--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', ...(jsonSchema ? ["--json-schema", JSON.stringify(jsonSchema)] : []), ...(preset.options.effort ? ["--effort", preset.options.effort] : []), ...model], input: prompt };
+    case "claude": return { args: ["-p", "--output-format", "json", "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep,WebSearch,WebFetch", "--no-session-persistence", "--safe-mode", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', ...(jsonSchema ? ["--json-schema", JSON.stringify(jsonSchema)] : []), ...(preset.options.effort ? ["--effort", preset.options.effort] : []), ...model], input: prompt };
     case "reasonix": return { args: ["run", "--dir", ".", "--model", preset.model, "--max-steps", "3"], input: prompt };
-    case "grok": return { args: ["--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep", "--no-subagents", "--no-memory", "--cwd", ".", ...(preset.options.effort ? ["--effort", preset.options.effort] : []), ...model, "--single", prompt] };
-    case "pi": return { args: ["--mode", "json", "--print", "--no-session", "--no-approve", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls", ...(preset.options.thinking ? ["--thinking", preset.options.thinking] : []), ...model, prompt] };
-    case "codebuddy": return { args: ["-p", "--output-format", "json", "--permission-mode", "plan", "--tools", "Read,Glob,Grep", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "user", ...model, prompt] };
+    case "grok": return {
+      args: [
+        ...(schemaRule ? ["--rules", schemaRule] : []),
+        "--output-format", "json", "--permission-mode", "dontAsk", "--no-plan", "--verbatim",
+        "--tools", "Read,Glob,Grep", "--disable-web-search", "--no-subagents", "--no-memory", "--cwd", ".",
+        ...(preset.options.effort ? ["--effort", preset.options.effort] : []),
+        ...model,
+        "--single",
+        "这是受限只读调用。只能使用 Read、Glob、Grep；不要调用 CodeGraph、MCP 或 shell。" +
+          "即使工作目录说明建议其他工具，也必须留在上述可用工具范围内。\n\n" + prompt,
+      ],
+    };
+    case "pi": return { args: ["--mode", boundedJsonOutput ? "json" : "text", "--print", "--no-session", "--no-approve", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--tools", "read,grep,find,ls", ...(preset.options.thinking ? ["--thinking", preset.options.thinking] : []), ...model, prompt] };
+    case "codebuddy": return { args: ["-p", "--output-format", "text", "--permission-mode", "dontAsk", "--tools", "Read,Glob,Grep", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}', "--setting-sources", "project", ...(jsonSchema ? ["--json-schema", JSON.stringify(jsonSchema)] : []), ...model, prompt] };
     case "agy": return { args: ["--mode", "plan", "--sandbox", "--print-timeout", `${Math.max(1, cli.timeoutSeconds)}s`, ...model, "--print", prompt] };
     default: throw new MadError("CONFIG", `GenericCliAdapter 不支持：${cli.adapter}`);
   }
@@ -45,7 +60,9 @@ export class GenericCliAdapter implements CliAdapter {
   public readonly projectReadOnlyCapability: "unsupported" | "runtime-canary";
 
   public constructor(private readonly cli: CliConfig, private readonly preset: InvocationPreset) {
-    this.projectReadOnlyCapability = cli.adapter === "reasonix" ? "unsupported" : "runtime-canary";
+    this.projectReadOnlyCapability = cli.adapter === "reasonix" || cli.adapter === "agy"
+      ? "unsupported"
+      : "runtime-canary";
   }
 
   public async probe(signal?: AbortSignal, cwd?: string): Promise<PreflightResult> {
@@ -81,7 +98,13 @@ export class GenericCliAdapter implements CliAdapter {
 
   public async invoke(request: InvocationRequest): Promise<AdapterResult> {
     if (process.env.MAD_PARTICIPANT === "1") throw new MadError("EXECUTION", "禁止从参与者进程递归调用 mad");
-    const command = buildInvocationCommand(this.cli, this.preset, request.prompt, request.jsonSchema);
+    const command = buildInvocationCommand(
+      this.cli,
+      this.preset,
+      request.prompt,
+      request.jsonSchema,
+      request.boundedJsonOutput,
+    );
     const result = await runProcess(this.cli.executable, command.args, {
       cwd: request.cwd,
       ...(command.input === undefined ? {} : { input: command.input }),
@@ -93,8 +116,16 @@ export class GenericCliAdapter implements CliAdapter {
       throw genericExitError(this.cli.id, result.exitCode, result.stderr || result.stdout);
     }
     const reportedError = publicError(result.stdout);
-    if (reportedError) throw new MadError("EXECUTION", `${this.cli.id} 调用失败：${redactAdapterDiagnostic(reportedError)}`);
-    const text = publicText(result.stdout);
+    if (reportedError) {
+      const ErrorType = isLikelyTransientFailure(reportedError) || /调用已取消/.test(reportedError)
+        ? RetryableMadError
+        : MadError;
+      throw new ErrorType("EXECUTION", `${this.cli.id} 调用失败：${redactAdapterDiagnostic(reportedError)}`);
+    }
+    const expectedStructured = this.cli.adapter === "claude" || this.cli.adapter === "grok" ||
+      (this.cli.adapter === "codebuddy" && request.jsonSchema !== undefined) ||
+      (this.cli.adapter === "pi" && request.boundedJsonOutput === true);
+    const text = publicText(result.stdout, expectedStructured);
     if (!text) throw new MadError("EXECUTION", `${this.cli.id} 未返回公开文本`);
     return { text, durationMs: result.durationMs, diagnostic: { executable: this.cli.executable, exitCode: result.exitCode, stderr: redactAdapterDiagnostic(result.stderr) } };
   }

@@ -13,6 +13,7 @@ describe("project read-only runtime canary", () => {
     await expect(verifyReadOnlyWithCanary(invoke)).resolves.toMatchObject({ verified: true });
     expect(invoke).toHaveBeenCalledTimes(1);
     expect(invoke).toHaveBeenCalledWith(expect.objectContaining({
+      boundedJsonOutput: true,
       jsonSchema: {
         type: "object",
         properties: {
@@ -130,5 +131,37 @@ describe("project read-only runtime canary", () => {
       verified: false,
       detail: expect.stringMatching(/不匹配/),
     });
+    expect(invoke).toHaveBeenCalledTimes(3);
+  });
+
+  it("retries one transient nonce mismatch before accepting valid evidence", async () => {
+    const invoke = vi.fn(async ({ cwd }: { cwd: string }) => ({
+      text: JSON.stringify({
+        read_nonce: invoke.mock.calls.length === 1 ? "guessed" : await readFile(`${cwd}/readable.txt`, "utf8"),
+        write_result: "blocked",
+      }),
+      durationMs: 1,
+      diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
+    }));
+
+    await expect(verifyReadOnlyWithCanary(invoke)).resolves.toMatchObject({ verified: true });
+    expect(invoke).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the evidence retry budget for transient empty public responses", async () => {
+    const invoke = vi.fn(async ({ cwd }: { cwd: string }) => {
+      if (invoke.mock.calls.length < 3) throw new Error("agy 未返回公开文本");
+      return {
+        text: JSON.stringify({
+          read_nonce: await readFile(`${cwd}/readable.txt`, "utf8"),
+          write_result: "blocked",
+        }),
+        durationMs: 1,
+        diagnostic: { executable: "fake", exitCode: 0, stderr: "" },
+      };
+    });
+
+    await expect(verifyReadOnlyWithCanary(invoke)).resolves.toMatchObject({ verified: true });
+    expect(invoke).toHaveBeenCalledTimes(3);
   });
 });

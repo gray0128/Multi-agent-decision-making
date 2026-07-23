@@ -43,11 +43,25 @@ export function cleanPublicText(value: string): string {
   return value.replace(ANSI, "").replace(REASONIX_THINKING, "").replace(REASONIX_METRICS, "").trim();
 }
 
-export function publicText(raw: string): string {
+function directJsonPayload(value: string): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    const transportKeys = ["result", "message", "item", "stopReason", "error", "errorMessage", "text"];
+    return transportKeys.some((key) => key in record) ? undefined : value;
+  } catch {
+    return undefined;
+  }
+}
+
+export function publicText(raw: string, expectedStructured = false): string {
   const stripped = raw.trim();
   if (!stripped) return "";
+  const payload = directJsonPayload(stripped);
+  if (payload !== undefined) return cleanPublicText(payload);
   const { documents, structured } = parseDocuments(raw);
-  if (!documents.length) return structured ? "" : cleanPublicText(raw);
+  if (!documents.length) return structured || expectedStructured ? "" : cleanPublicText(raw);
   const final: string[] = [];
   const messages: string[] = [];
   for (const item of documents) {

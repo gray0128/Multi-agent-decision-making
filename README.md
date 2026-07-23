@@ -349,7 +349,7 @@ agy models
 agy agents
 ```
 
-使用当前 CLI 显示的完整名称，例如 `Gemini 3.5 Flash (Low)`。
+使用当前 CLI 显示的精确模型 ID，例如 `gemini-3.5-flash-low`。
 
 ### guided 模式提示没有交互通道
 

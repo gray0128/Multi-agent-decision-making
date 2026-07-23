@@ -137,13 +137,6 @@ id = "hy3"
 model = "hy3"
 context_budget = 256000
 
-# CodeBuddy 平台模型 ID；与规范模型 kimi-k3 的精确映射仍待核实。
-# Kimi K3 规格为 1048576 context / 131072 output；MAD 上限截为 1000000。
-[[clis.presets]]
-id = "kimi-k3-2"
-model = "kimi-k3-2"
-context_budget = 1000000
-
 [[clis]]
 id = "agy"
 adapter = "agy"
@@ -155,5 +148,5 @@ max_concurrency = 1
 # MAD 上限截为 1000000。pro / flash_lite 的规范模型 ID 尚未核实，因此不写入可用 preset。
 [[clis.presets]]
 id = "flash"
-model = "Gemini 3.5 Flash (High)"
+model = "gemini-3.5-flash-high"
 context_budget = 1000000
