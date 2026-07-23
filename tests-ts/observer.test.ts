@@ -70,6 +70,8 @@ describe("authenticated observer service", () => {
     expect(STYLES_CSS).toContain("--content-size:15px");
     expect(STYLES_CSS).toContain(".archive-layout");
     expect(STYLES_CSS).toContain(".anchor-rail");
+    expect(STYLES_CSS).toContain(".anchor-rail{position:sticky;top:18px;max-height:calc(100vh - 36px);overflow:auto;border-left:1px solid var(--soft-rule);padding:0 15px");
+    expect(STYLES_CSS).toContain(".process-output .content{font-size:13px;line-height:1.55;color:#4f4e47;max-width:none}");
     expect(STYLES_CSS).toContain(".table-scroll");
     expect(STYLES_CSS).toContain("position:sticky");
   });
