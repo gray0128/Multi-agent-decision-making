@@ -8,12 +8,14 @@ export interface PendingCheckpoint {
   readonly kind: string;
   readonly summary: string;
   readonly actions: readonly string[];
+  readonly data?: unknown;
 }
 
 export interface CheckpointResponse {
   readonly checkpointId: string;
   readonly action: string;
   readonly guidance: string;
+  readonly data?: unknown;
   readonly at: string;
 }
 
@@ -46,7 +48,7 @@ export class CheckpointMailbox {
 
   public async wait(
     pending: PendingCheckpoint,
-    local?: (signal: AbortSignal) => Promise<{ action: string; guidance?: string }>,
+    local?: (signal: AbortSignal) => Promise<{ action: string; guidance?: string; data?: unknown }>,
     signal?: AbortSignal,
     onPublished?: (checkpointId: string) => Promise<void>,
     existingCheckpointId?: string,
@@ -67,7 +69,7 @@ export class CheckpointMailbox {
     let localError: unknown;
     let consumed = false;
     const localTask = local?.(abort.signal).then(async (response) => {
-      await this.submit(checkpointId, response.action, response.guidance ?? "");
+      await this.submit(checkpointId, response.action, response.guidance ?? "", response.data);
     }).catch((error: unknown) => {
       if (!(error instanceof Error && error.name === "AbortError")) localError = error;
     });
@@ -94,11 +96,12 @@ export class CheckpointMailbox {
     }
   }
 
-  public async submit(checkpointId: string, action: string, guidance = ""): Promise<boolean> {
+  public async submit(checkpointId: string, action: string, guidance = "", data?: unknown): Promise<boolean> {
     return publishExclusiveJson(this.responsePath, {
       checkpointId,
       action,
       guidance,
+      ...(data === undefined ? {} : { data }),
       at: new Date().toISOString(),
     });
   }

@@ -82,6 +82,7 @@ export interface DeliberationManifest {
     readonly allowRegeneration: boolean;
     readonly projectMode: boolean;
     readonly generation: number;
+    readonly candidateVersion?: number;
     readonly candidatePlan?: DeliberationPlan;
   };
 }

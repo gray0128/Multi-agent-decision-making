@@ -2,14 +2,26 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { chmod, readFile, readdir, writeFile, rename, mkdir, unlink } from "node:fs/promises";
 import { join } from "node:path";
+import { createAdapter } from "../adapters/index.js";
+import { loadCliRegistry, resolveInvocation, type CliRegistry } from "../adapters/config.js";
+import { redactAdapterDiagnostic } from "../adapters/redact.js";
+import type { PreflightResult } from "../adapters/types.js";
+import { DEFAULT_LIMITS, SAFE_MAX_LIMITS, resolveLimits } from "../core/limits.js";
 import type { AppPaths } from "../core/paths.js";
 import { APP_JS, INDEX_HTML, STYLES_CSS } from "../web/index.js";
 import { renderMarkdown } from "../web/markdown.js";
 import { publishExclusiveJson } from "./mailbox.js";
 import { ArchiveStore } from "../archive/store.js";
 import { SERVER_HOST } from "./constants.js";
+import {
+  ActiveLaunchConflict,
+  LaunchCoordinator,
+  type DeliberationProcessLauncher,
+  type WebLaunchRequest,
+} from "./launch-coordinator.js";
 
 const ID = /^[a-zA-Z0-9_-]{1,80}$/;
+const REQUEST_ID = /^[a-zA-Z0-9_-]{1,80}$/;
 
 async function jsonFile(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8"));
@@ -105,11 +117,52 @@ export interface ObserverServer {
   close(): Promise<void>;
 }
 
-export async function startObserverServer(paths: AppPaths, port = 0): Promise<ObserverServer> {
+export interface ObserverServerDependencies {
+  readonly loadRegistry?: () => Promise<CliRegistry>;
+  readonly checkInvocation?: (
+    cli: CliRegistry["clis"][number],
+    preset: CliRegistry["clis"][number]["presets"][number],
+  ) => Promise<PreflightResult>;
+  readonly launchDeliberation?: DeliberationProcessLauncher;
+}
+
+interface PublicLaunchCli {
+  readonly id: string;
+  readonly presets: readonly {
+    readonly id: string;
+    readonly model: string;
+    readonly contextBudget: number;
+    readonly options: CliRegistry["clis"][number]["presets"][number]["options"];
+    readonly available: boolean;
+    readonly reason?: string;
+  }[];
+}
+
+async function activeDeliberation(paths: AppPaths): Promise<{ id: string } | null> {
+  try {
+    const value = JSON.parse(await readFile(join(paths.runtime, "active.lock"), "utf8")) as {
+      deliberationId?: unknown;
+      pid?: unknown;
+    };
+    if (typeof value.deliberationId !== "string" || !Number.isSafeInteger(value.pid)) return null;
+    process.kill(value.pid as number, 0);
+    return { id: value.deliberationId };
+  } catch {
+    return null;
+  }
+}
+
+export async function startObserverServer(
+  paths: AppPaths,
+  port = 0,
+  dependencies: ObserverServerDependencies = {},
+): Promise<ObserverServer> {
   await Promise.all([paths.home, paths.deliberations, paths.runtime].map(async (path) => {
     await mkdir(path, { recursive: true, mode: 0o700 });
     await chmod(path, 0o700);
   }));
+  const coordinator = new LaunchCoordinator(paths, dependencies.launchDeliberation);
+  let launchOptionsCache: { expiresAt: number; registry: CliRegistry; clis: readonly PublicLaunchCli[] } | undefined;
   const token = randomBytes(32).toString("base64url");
   const server = createServer(async (request, response) => {
     try {
@@ -118,6 +171,148 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
       if (request.method === "GET" && url.pathname === "/styles.css") return send(response, 200, STYLES_CSS, "text/css; charset=utf-8");
       if (request.method === "GET" && url.pathname === "/app.js") return send(response, 200, APP_JS, "text/javascript; charset=utf-8");
       if (!url.pathname.startsWith("/api/") || !authorized(request, token)) return send(response, 401, "Unauthorized");
+      if (request.method === "GET" && url.pathname === "/api/launch-options") {
+        if (!launchOptionsCache || launchOptionsCache.expiresAt <= Date.now()) {
+          const registry = await (dependencies.loadRegistry ?? (() => loadCliRegistry(paths.config)))();
+          const check = dependencies.checkInvocation ?? ((cli, preset) => createAdapter(cli, preset).check(process.cwd()));
+          const clis = await Promise.all(registry.clis.map(async (cli) => ({
+            id: cli.id,
+            presets: await Promise.all(cli.presets.map(async (preset) => {
+              try {
+                const result = await check(cli, preset);
+                return {
+                  id: preset.id,
+                  model: preset.model,
+                  contextBudget: preset.contextBudget,
+                  options: preset.options,
+                  available: result.ready,
+                  ...(result.ready ? {} : { reason: redactAdapterDiagnostic(result.detail ?? "预检失败") }),
+                };
+              } catch (error) {
+                return {
+                  id: preset.id,
+                  model: preset.model,
+                  contextBudget: preset.contextBudget,
+                  options: preset.options,
+                  available: false,
+                  reason: redactAdapterDiagnostic(error instanceof Error ? error.message : String(error)),
+                };
+              }
+            })),
+          })));
+          launchOptionsCache = { expiresAt: Date.now() + 30_000, registry, clis };
+        }
+        const { registry, clis } = launchOptionsCache!;
+        const active = await activeDeliberation(paths);
+        return send(response, 200, JSON.stringify({
+          defaults: {
+            mode: "structured",
+            interaction: "guided",
+            organizer: registry.defaults.generator,
+            limits: DEFAULT_LIMITS,
+          },
+          limitRange: {
+            minimums: Object.fromEntries(Object.keys(SAFE_MAX_LIMITS).map((key) => [key, 1])),
+            maximums: SAFE_MAX_LIMITS,
+          },
+          clis,
+          activeDeliberation: active,
+          canLaunch: active === null,
+        }), "application/json; charset=utf-8");
+      }
+      const launchMatch = /^\/api\/launches\/([^/]+)$/.exec(url.pathname);
+      if (request.method === "GET" && launchMatch) {
+        const requestId = decodeURIComponent(launchMatch[1]!);
+        if (!REQUEST_ID.test(requestId)) return send(response, 400, "Invalid request id");
+        const record = await coordinator.read(requestId);
+        return record
+          ? send(response, 200, JSON.stringify(record), "application/json; charset=utf-8")
+          : send(response, 404, "Launch request not found");
+      }
+      if (request.method === "POST" && url.pathname === "/api/launches") {
+        let payload: Record<string, unknown>;
+        try { payload = await body(request); } catch (error) {
+          return send(response, 400, error instanceof Error ? error.message : String(error));
+        }
+        const allowed = ["requestId", "topic", "mode", "interaction", "workspace", "organizer", "limits"];
+        const extras = Object.keys(payload).filter((key) => !allowed.includes(key));
+        if (extras.length) return send(response, 400, `Unknown fields: ${extras.join(", ")}`);
+        if (typeof payload.requestId !== "string" || !REQUEST_ID.test(payload.requestId)) {
+          return send(response, 400, "Invalid request id");
+        }
+        const existing = await coordinator.read(payload.requestId);
+        if (existing) {
+          return send(response, 200, JSON.stringify(existing), "application/json; charset=utf-8");
+        }
+        if (typeof payload.topic !== "string" || !payload.topic.trim() || payload.topic.trim().length > 5_000) {
+          return send(response, 400, "topic must be 1 to 5000 characters");
+        }
+        if (payload.mode !== "structured" && payload.mode !== "free") return send(response, 400, "Invalid mode");
+        const interaction = payload.interaction ?? "guided";
+        if (interaction !== "guided" && interaction !== "auto") return send(response, 400, "Invalid interaction");
+        const active = await activeDeliberation(paths);
+        if (active) {
+          return send(response, 409, JSON.stringify({ code: "ACTIVE_DELIBERATION", activeDeliberation: active }), "application/json; charset=utf-8");
+        }
+        const registry = await (dependencies.loadRegistry ?? (() => loadCliRegistry(paths.config)))();
+        let organizer: WebLaunchRequest["organizer"];
+        if (payload.organizer !== undefined) {
+          if (typeof payload.organizer !== "object" || payload.organizer === null || Array.isArray(payload.organizer)) {
+            return send(response, 400, "organizer must be an object");
+          }
+          const value = payload.organizer as Record<string, unknown>;
+          if (Object.keys(value).some((key) => !["cli", "preset"].includes(key)) ||
+            typeof value.cli !== "string" || typeof value.preset !== "string") {
+            return send(response, 400, "Invalid organizer");
+          }
+          try { resolveInvocation(registry, value.cli, value.preset); } catch (error) {
+            return send(response, 400, error instanceof Error ? error.message : String(error));
+          }
+          organizer = { cli: value.cli, preset: value.preset };
+        }
+        let limits: WebLaunchRequest["limits"];
+        if (payload.limits !== undefined) {
+          if (typeof payload.limits !== "object" || payload.limits === null || Array.isArray(payload.limits)) {
+            return send(response, 400, "limits must be an object");
+          }
+          const value = payload.limits as Record<string, unknown>;
+          const limitKeys = ["maxParticipants", "maxCalls", "maxDiscussionWindows", "timeoutSeconds", "contextBudget", "globalConcurrency"];
+          if (Object.keys(value).some((key) => !limitKeys.includes(key))) return send(response, 400, "Invalid limits fields");
+          try { limits = resolveLimits(value); } catch (error) {
+            return send(response, 400, error instanceof Error ? error.message : String(error));
+          }
+        }
+        let workspace: string | undefined;
+        if (payload.workspace !== undefined) {
+          if (typeof payload.workspace !== "string" || !payload.workspace.trim() || payload.workspace.length > 4_096) {
+            return send(response, 400, "Invalid workspace");
+          }
+          workspace = payload.workspace.trim();
+        }
+        const launchRequest: WebLaunchRequest = {
+          requestId: payload.requestId,
+          topic: payload.topic.trim(),
+          mode: payload.mode,
+          interaction,
+          ...(workspace ? { workspace } : {}),
+          ...(organizer ? { organizer } : {}),
+          ...(limits ? { limits } : {}),
+        };
+        let record;
+        try {
+          record = await coordinator.launch(launchRequest);
+        } catch (error) {
+          if (error instanceof ActiveLaunchConflict) {
+            return send(response, 409, JSON.stringify({
+              code: "ACTIVE_DELIBERATION",
+              activeDeliberation: { id: error.deliberationId },
+            }), "application/json; charset=utf-8");
+          }
+          throw error;
+        }
+        const status = record.status === "failed" ? 500 : record.status === "planning" ? 201 : 202;
+        return send(response, status, JSON.stringify(record), "application/json; charset=utf-8");
+      }
       if (request.method === "GET" && url.pathname === "/api/deliberations") {
         await mkdir(paths.deliberations, { recursive: true, mode: 0o700 });
         const entries = await readdir(paths.deliberations, { withFileTypes: true });
@@ -134,6 +329,20 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
         const records = loaded.filter((record): record is NonNullable<typeof record> => record !== null);
         records.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
         return send(response, 200, JSON.stringify(records), "application/json; charset=utf-8");
+      }
+      const agentIdMatch = /^\/api\/deliberations\/([^/]+)\/agent-id$/.exec(url.pathname);
+      if (request.method === "POST" && agentIdMatch) {
+        const id = decodeURIComponent(agentIdMatch[1]!);
+        if (!ID.test(id)) return send(response, 400, "Invalid id");
+        const archive = new ArchiveStore(paths.deliberations, id);
+        const [manifest, state] = await Promise.all([archive.readManifest(), archive.readState()]);
+        if (manifest.plan || !["planning", "waiting_checkpoint"].includes(state.status)) {
+          return send(response, 409, "Deliberation is not accepting plan edits");
+        }
+        const existing = new Set((manifest.planning?.candidatePlan?.participants ?? []).map((agent) => agent.id));
+        let agentId = "";
+        do { agentId = `agent-${randomBytes(6).toString("hex")}`; } while (existing.has(agentId));
+        return send(response, 201, JSON.stringify({ id: agentId }), "application/json; charset=utf-8");
       }
       const detailMatch = /^\/api\/deliberations\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && detailMatch) {
@@ -170,7 +379,12 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
         const id = decodeURIComponent(respondMatch[1]!);
         if (!ID.test(id)) return send(response, 400, "Invalid id");
         const requestPath = join(paths.runtime, "checkpoints", `${id}.request.json`);
-        let pending: { checkpointId: string; actions: string[] };
+        let pending: {
+          checkpointId: string;
+          kind?: string;
+          actions: string[];
+          data?: { candidateVersion?: unknown };
+        };
         try {
           pending = await jsonFile(requestPath) as { checkpointId: string; actions: string[] };
         } catch (error) {
@@ -182,6 +396,20 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
           return send(response, 400, error instanceof Error ? error.message : String(error));
         }
         const guidance = payload.guidance ?? "";
+        if (pending.kind === "plan_confirmation") {
+          const allowed = new Set(["checkpointId", "action", "candidateVersion", "guidance", "data"]);
+          const extras = Object.keys(payload).filter((key) => !allowed.has(key));
+          if (extras.length) return send(response, 400, `Unknown fields: ${extras.join(", ")}`);
+          if (payload.candidateVersion !== pending.data?.candidateVersion) {
+            return send(response, 409, "Stale candidate version");
+          }
+          if (payload.action === "replace" && (
+            typeof payload.data !== "object" || payload.data === null || Array.isArray(payload.data)
+          )) return send(response, 400, "Replacement plan must be an object");
+          if (payload.action !== "replace" && payload.data !== undefined) {
+            return send(response, 400, "Checkpoint action does not accept plan data");
+          }
+        }
         if (
           payload.checkpointId !== pending.checkpointId ||
           typeof payload.action !== "string" ||
@@ -196,6 +424,7 @@ export async function startObserverServer(paths: AppPaths, port = 0): Promise<Ob
           checkpointId: payload.checkpointId,
           action: payload.action,
           guidance,
+          ...(payload.data === undefined ? {} : { data: payload.data }),
           at: new Date().toISOString(),
         })) return send(response, 409, "Checkpoint already answered");
         return send(response, 202, JSON.stringify({ accepted: true }), "application/json; charset=utf-8");

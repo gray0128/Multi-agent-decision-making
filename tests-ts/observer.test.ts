@@ -40,6 +40,172 @@ describe("authenticated observer service", () => {
     expect(APP_JS).toContain("d.message");
   });
 
+  it("exposes authenticated safe launch options and the three-step entry", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-launch-options-"));
+    const paths = appPaths(home);
+    await mkdir(paths.runtime, { recursive: true });
+    await writeFile(join(paths.runtime, "active.lock"), JSON.stringify({
+      deliberationId: "active-1",
+      pid: process.pid,
+    }));
+    const observer = await startObserverServer(paths, 0, {
+      loadRegistry: async () => ({
+        defaults: { generator: { cli: "codex", preset: "deep" } },
+        clis: [{
+          id: "codex",
+          adapter: "codex",
+          executable: "/secret/bin/codex",
+          timeoutSeconds: 300,
+          maxConcurrency: 2,
+          presets: [{
+            id: "deep",
+            model: "gpt-safe",
+            contextBudget: 64_000,
+            options: { reasoningEffort: "high" },
+          }],
+        }],
+      }),
+      checkInvocation: async () => ({ ready: false, detail: "token=super-secret unavailable" }),
+    });
+    try {
+      const endpoint = `http://127.0.0.1:${observer.port}/api/launch-options`;
+      expect((await fetch(endpoint)).status).toBe(401);
+      const response = await fetch(endpoint, { headers: { Authorization: `Bearer ${observer.token}` } });
+      expect(response.status).toBe(200);
+      const text = await response.text();
+      expect(text).not.toContain("/secret/bin/codex");
+      expect(text).not.toContain("super-secret");
+      expect(JSON.parse(text)).toMatchObject({
+        defaults: { mode: "structured", interaction: "guided", organizer: { cli: "codex", preset: "deep" } },
+        clis: [{ id: "codex", presets: [{ id: "deep", model: "gpt-safe", available: false }] }],
+        activeDeliberation: { id: "active-1" },
+        canLaunch: false,
+      });
+      expect(APP_JS).toContain("launch-deliberation");
+      expect(APP_JS).toContain("wizard-steps");
+    } finally {
+      await observer.close();
+    }
+  });
+
+  it("idempotently launches an independent planning deliberation", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-web-launch-"));
+    const paths = appPaths(home);
+    const spawned: string[] = [];
+    const registry = {
+      defaults: { generator: { cli: "codex", preset: "deep" } },
+      clis: [{
+        id: "codex", adapter: "codex" as const, executable: "codex", timeoutSeconds: 300, maxConcurrency: 1,
+        presets: [{ id: "deep", model: "gpt-safe", contextBudget: 64_000, options: {} }],
+      }],
+    };
+    const observer = await startObserverServer(paths, 0, {
+      loadRegistry: async () => registry,
+      launchDeliberation: async (request, id) => {
+        spawned.push(id);
+        const archive = new ArchiveStore(paths.deliberations, id);
+        await archive.create({
+          schemaVersion: 1,
+          id,
+          createdAt: new Date().toISOString(),
+          question: request.topic,
+          mode: request.mode,
+          interaction: request.interaction,
+          planning: {
+            organizer: registry.defaults.generator,
+            limits: { maxParticipants: 5, maxCalls: 60, maxDiscussionWindows: 6, timeoutSeconds: 300, contextBudget: 128_000, globalConcurrency: 6 },
+            autoConfirmPlan: false,
+            allowRegeneration: true,
+            projectMode: false,
+            generation: 0,
+            candidateVersion: 0,
+          },
+        });
+        await writeFile(join(paths.runtime, "active.lock"), JSON.stringify({ deliberationId: id, pid: process.pid }));
+      },
+    });
+    try {
+      const endpoint = `http://127.0.0.1:${observer.port}/api/launches`;
+      const authorization = { Authorization: `Bearer ${observer.token}`, "Content-Type": "application/json" };
+      const payload = { requestId: "request-1", topic: "是否发布？", mode: "structured" };
+      expect((await fetch(endpoint, { method: "POST", body: JSON.stringify(payload) })).status).toBe(401);
+      const first = await fetch(endpoint, { method: "POST", headers: authorization, body: JSON.stringify(payload) });
+      expect(first.status).toBe(201);
+      const firstBody = await first.json() as { deliberationId: string; status: string };
+      expect(firstBody.status).toBe("planning");
+      const repeated = await fetch(endpoint, { method: "POST", headers: authorization, body: JSON.stringify(payload) });
+      expect(repeated.status).toBe(200);
+      expect(await repeated.json()).toMatchObject({ deliberationId: firstBody.deliberationId, status: "planning" });
+      expect(spawned).toEqual([firstBody.deliberationId]);
+      expect((await fetch(endpoint, {
+        method: "POST",
+        headers: authorization,
+        body: JSON.stringify({ ...payload, requestId: "request-2", surprise: true }),
+      })).status).toBe(400);
+      const conflict = await fetch(endpoint, {
+        method: "POST",
+        headers: authorization,
+        body: JSON.stringify({ ...payload, requestId: "request-2", topic: "另一项审议" }),
+      });
+      expect(conflict.status).toBe(409);
+      expect(await conflict.json()).toMatchObject({
+        code: "ACTIVE_DELIBERATION",
+        activeDeliberation: { id: firstBody.deliberationId },
+      });
+      expect(await readFile(join(paths.runtime, "launches", "request-1.json"), "utf8")).toContain(firstBody.deliberationId);
+    } finally {
+      await observer.close();
+    }
+    const persisted = JSON.parse(await readFile(join(paths.runtime, "launches", "request-1.json"), "utf8")) as { deliberationId: string };
+    const restarted = await startObserverServer(paths, 0, {
+      loadRegistry: async () => registry,
+      launchDeliberation: async () => { throw new Error("must not spawn an idempotent retry"); },
+    });
+    try {
+      const repeated = await fetch(`http://127.0.0.1:${restarted.port}/api/launches`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${restarted.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId: "request-1", topic: "是否发布？", mode: "structured" }),
+      });
+      expect(repeated.status).toBe(200);
+      expect(await repeated.json()).toMatchObject({ deliberationId: persisted.deliberationId });
+      expect(spawned).toEqual([persisted.deliberationId]);
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it("persists and redacts a spawn failure without reporting a successful launch", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-web-launch-failure-"));
+    const paths = appPaths(home);
+    const observer = await startObserverServer(paths, 0, {
+      loadRegistry: async () => ({
+        defaults: { generator: { cli: "codex", preset: "deep" } },
+        clis: [{
+          id: "codex", adapter: "codex", executable: "codex", timeoutSeconds: 300, maxConcurrency: 1,
+          presets: [{ id: "deep", model: "gpt-safe", contextBudget: 64_000, options: {} }],
+        }],
+      }),
+      launchDeliberation: async () => { throw new Error("token=highly-secret spawn failed"); },
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${observer.port}/api/launches`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${observer.token}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ requestId: "failed-request", topic: "失败启动", mode: "structured" }),
+      });
+      expect(response.status).toBe(500);
+      const text = await response.text();
+      expect(text).not.toContain("highly-secret");
+      expect(text).toContain("[REDACTED]");
+      const persisted = await readFile(join(paths.runtime, "launches", "failed-request.json"), "utf8");
+      expect(persisted).toContain('"status": "failed"');
+      expect(persisted).not.toContain("highly-secret");
+    } finally {
+      await observer.close();
+    }
+  });
+
   it("binds locally, protects APIs, and accepts a checkpoint response only once", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-observer-"));
     const paths = appPaths(home);

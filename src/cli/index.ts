@@ -18,7 +18,7 @@ import {
 import { runProcess } from "../adapters/process.js";
 import { buildProbeCommand } from "../adapters/generic.js";
 import { EXIT_CODES, MadError } from "../core/errors.js";
-import { appPaths } from "../core/paths.js";
+import { appPaths, assertDeliberationId } from "../core/paths.js";
 import { resolveLimits } from "../core/limits.js";
 import { OrganizerService, parseDeliberationPlan } from "../core/planning.js";
 import { StructuredController, type CheckpointHandler } from "../core/structured.js";
@@ -206,58 +206,118 @@ async function confirmPlan(
     readonly organizer: InvocationPresetRef;
     readonly cwd: string;
     readonly projectMode: boolean;
+    readonly mailbox: CheckpointMailbox;
+    readonly archive: ArchiveStore;
+    readonly terminalAvailable: boolean;
     readonly signal?: AbortSignal;
     readonly initialGeneration?: number;
-    readonly onCandidate?: (plan: DeliberationPlan, generation: number) => Promise<void>;
+    readonly initialVersion?: number;
+    readonly onCandidate?: (plan: DeliberationPlan, generation: number, version: number) => Promise<void>;
   },
 ): Promise<DeliberationPlan> {
-  const terminal = createInterface({ input: process.stdin, output: process.stderr });
   let plan = initial;
   let generation = context.initialGeneration ?? 0;
-  try {
-    while (true) {
-      process.stderr.write(`最终审议方案：\n${JSON.stringify(externalPlan(plan), null, 2)}\n`);
-      let answer: string;
+  let version = context.initialVersion ?? 0;
+  let validationError = "";
+  while (true) {
+    process.stderr.write(`最终审议方案：\n${JSON.stringify(externalPlan(plan), null, 2)}\n`);
+    if (validationError) process.stderr.write(`方案校验失败：${validationError}\n`);
+    const key = `planning:${generation}:${version}`;
+    const pending = {
+      kind: "plan_confirmation",
+      summary: validationError || "候选审议方案等待确认",
+      actions: ["confirm", "replace", "regroup", "cancel"],
+      data: { candidatePlan: externalPlan(plan), generation, candidateVersion: version, validationError },
+    } as const;
+    const state = await context.archive.readState();
+    const existingId = state.pendingCheckpoint?.key === key ? state.pendingCheckpoint.checkpointId : undefined;
+    const response = await context.mailbox.wait(
+      pending,
+      context.terminalAvailable ? async (signal) => {
+        const terminal = createInterface({ input: process.stdin, output: process.stderr });
+        try {
+          const answer = (await terminal.question(
+            "回车确认；输入完整 JSON 修改；/regroup 指导 重新组局；/cancel 取消：",
+            { signal },
+          )).trim();
+          if (!answer) return { action: "confirm" };
+          if (answer === "/cancel") return { action: "cancel" };
+          if (answer.startsWith("/regroup")) {
+            return { action: "regroup", guidance: answer.slice("/regroup".length).trim() };
+          }
+          try {
+            return { action: "replace", data: JSON.parse(answer) as unknown };
+          } catch (error) {
+            throw new MadError("USAGE", `方案不是有效 JSON：${error instanceof Error ? error.message : String(error)}`);
+          }
+        } finally {
+          terminal.close();
+        }
+      } : undefined,
+      context.signal,
+      async (checkpointId) => {
+        await context.archive.setStatus("waiting_checkpoint");
+        await context.archive.setPendingCheckpoint(key, checkpointId, pending);
+        await context.archive.appendEvent("checkpoint.pending", {
+          kind: pending.kind,
+          checkpointId,
+          generation,
+          candidateVersion: version,
+        });
+      },
+      existingId,
+      async (accepted) => context.archive.recordCheckpointDecision(key, accepted),
+    );
+    await context.archive.appendEvent("checkpoint.responded", {
+      kind: pending.kind,
+      action: response.action,
+      generation,
+      candidateVersion: version,
+    });
+    if (response.action === "confirm") return plan;
+    if (response.action === "cancel") throw new MadError("CANCELLED", "已取消审议");
+    validationError = "";
+    if (response.action === "regroup") {
       try {
-        const prompt = "回车确认；输入完整 JSON 修改；/regroup 指导 重新组局；/cancel 取消：";
-        answer = (context.signal
-          ? await terminal.question(prompt, { signal: context.signal })
-          : await terminal.question(prompt)).trim();
-      } catch (error) {
-        if (context.signal?.aborted) throw new MadError("PAUSED", "方案确认已暂停");
-        throw error;
-      }
-      if (!answer) return plan;
-      if (answer === "/cancel") throw new MadError("CANCELLED", "已取消审议");
-      if (answer.startsWith("/regroup")) {
-        const guidance = answer.slice("/regroup".length).trim();
-        generation += 1;
+        const nextGeneration = generation + 1;
         const regrouped = await organizerService.propose({
           question: context.question,
           mode: context.mode,
           limits: context.limits,
           organizer: context.organizer,
           cwd: context.cwd,
-          ...(guidance ? { guidance } : {}),
+          ...(response.guidance ? { guidance: response.guidance } : {}),
           ...(context.signal ? { signal: context.signal } : {}),
           projectMode: context.projectMode,
-          proposalId: `planning:organizer:proposal:${generation}`,
+          proposalId: `planning:organizer:proposal:${nextGeneration}`,
         });
+        generation = nextGeneration;
         plan = regrouped.plan;
-        await context.onCandidate?.(plan, generation);
-        continue;
+        version = 0;
+        await context.onCandidate?.(plan, generation, version);
+        await context.archive.appendEvent("plan.regrouped", { generation, candidateVersion: version });
+      } catch (error) {
+        validationError = error instanceof Error ? error.message : String(error);
+        await context.archive.appendEvent("plan.validation_failed", { action: "regroup", message: validationError });
       }
-      plan = parseDeliberationPlan(answer, {
+      continue;
+    }
+    try {
+      const replacement = parseDeliberationPlan(response.data, {
         registry: context.registry,
         mode: context.mode,
         limits: context.limits,
         organizer: context.organizer,
       });
-      await organizerService.preflightPlan(plan, context.cwd, context.signal, context.projectMode);
-      await context.onCandidate?.(plan, generation);
+      await organizerService.preflightPlan(replacement, context.cwd, context.signal, context.projectMode);
+      plan = replacement;
+      version += 1;
+      await context.onCandidate?.(plan, generation, version);
+      await context.archive.appendEvent("plan.candidate_replaced", { generation, candidateVersion: version });
+    } catch (error) {
+      validationError = error instanceof Error ? error.message : String(error);
+      await context.archive.appendEvent("plan.validation_failed", { action: "replace", message: validationError });
     }
-  } finally {
-    terminal.close();
   }
 }
 
@@ -373,6 +433,8 @@ async function deliberate(args: readonly string[]): Promise<void> {
       "timeout-seconds": { type: "string" },
       "context-budget": { type: "string" },
       "global-concurrency": { type: "string" },
+      id: { type: "string" },
+      "web-plan": { type: "boolean", default: false },
     },
   });
   if (parsed.positionals.length !== 1 || !parsed.positionals[0]?.trim()) {
@@ -384,7 +446,8 @@ async function deliberate(args: readonly string[]): Promise<void> {
   const format = parsed.values.format;
   if (format !== "markdown" && format !== "json") throw new MadError("USAGE", "--format 必须是 markdown 或 json");
   const interaction: InteractionPolicy = parsed.values.auto ? "auto" : "guided";
-  if (interaction === "auto" && !parsed.values["auto-confirm-plan"]) {
+  const webPlan = parsed.values["web-plan"];
+  if (interaction === "auto" && !parsed.values["auto-confirm-plan"] && !webPlan) {
     throw new MadError("USAGE", "--auto 必须同时显式传入 --auto-confirm-plan");
   }
   const paths = appPaths();
@@ -396,13 +459,10 @@ async function deliberate(args: readonly string[]): Promise<void> {
   const terminalAvailable = Boolean(process.stdin.isTTY && process.stderr.isTTY);
   const observerAvailable = await observerIsOnline(paths.runtime);
   if (interaction === "guided" && !terminalAvailable && !observerAvailable) {
-    throw new MadError("USAGE", "guided 模式需要交互终端或在线观察服务；当前尚无可用交互通道");
-  }
-  if (interaction === "guided" && !terminalAvailable && !parsed.values["auto-confirm-plan"]) {
-    throw new MadError("USAGE", "无交互终端时必须用 --auto-confirm-plan 接受首次有效组局方案");
+    throw new MadError("USAGE", "guided 模式需要交互终端或在线审议控制台；当前尚无可用交互通道");
   }
   const registry = await loadCliRegistry(paths.config);
-  const id = randomUUID();
+  const id = parsed.values.id ? assertDeliberationId(parsed.values.id) : randomUUID();
   let cwd = join(paths.runtime, "scratch", id);
   await ensurePrivateDirectory(cwd);
   let workspace: { path: string; mode: "direct-read-only" } | undefined;
@@ -453,9 +513,10 @@ async function deliberate(args: readonly string[]): Promise<void> {
       organizer,
       limits,
       autoConfirmPlan: parsed.values["auto-confirm-plan"],
-      allowRegeneration: interaction === "guided",
+      allowRegeneration: interaction === "guided" || webPlan,
       projectMode: Boolean(workspace),
       generation: 0,
+      candidateVersion: 0,
     };
     const baseManifest: DeliberationManifest = {
       schemaVersion: 1,
@@ -486,19 +547,22 @@ async function deliberate(args: readonly string[]): Promise<void> {
       limits,
       organizer,
       cwd,
-      allowRegeneration: interaction === "guided",
+      allowRegeneration: interaction === "guided" || webPlan,
       projectMode: Boolean(workspace),
       signal: interrupt.signal,
       proposalId: "planning:organizer:proposal:0",
     });
     planning = { ...planning, candidatePlan: proposed.plan };
     await archive.writeManifest({ ...baseManifest, planning });
-    const plan = interaction === "guided" && !parsed.values["auto-confirm-plan"]
+    const mailbox = new CheckpointMailbox(paths.runtime, id);
+    const plan = (webPlan || interaction === "guided") && !parsed.values["auto-confirm-plan"]
       ? await confirmPlan(proposed.plan, organizerService, {
         registry, question, mode, limits, organizer, cwd, projectMode: Boolean(workspace), signal: interrupt.signal,
+        mailbox, archive, terminalAvailable,
         initialGeneration: planning.generation,
-        onCandidate: async (candidatePlan, generation) => {
-          planning = { ...planning, candidatePlan, generation };
+        initialVersion: planning.candidateVersion ?? 0,
+        onCandidate: async (candidatePlan, generation, candidateVersion) => {
+          planning = { ...planning, candidatePlan, generation, candidateVersion };
           await archive.writeManifest({ ...baseManifest, planning });
         },
       })
@@ -510,14 +574,13 @@ async function deliberate(args: readonly string[]): Promise<void> {
       ...baseManifest,
       plan,
       planning: { ...planning, candidatePlan: plan },
-      planConfirmation: parsed.values["auto-confirm-plan"] ? "auto-first-valid" : "interactive",
+      planConfirmation: parsed.values["auto-confirm-plan"] && !webPlan ? "auto-first-valid" : "interactive",
     });
     await archive.appendEvent("plan.confirmed", { plan: externalPlan(plan), preflighted: proposed.preflightedCombinations });
     const sourceWarning = sharedOriginWarning(plan);
     const sourceWarnings = sourceWarning ? [sourceWarning] : [];
     const warnings = [...workspaceWarnings, ...sourceWarnings];
     await emitWarnings(archive, sourceWarnings);
-    const mailbox = new CheckpointMailbox(paths.runtime, id);
     const result = mode === "structured"
       ? await new StructuredController(
         registry,
@@ -542,7 +605,7 @@ async function deliberate(args: readonly string[]): Promise<void> {
   } catch (error) {
     if (archiveCreated) {
       const state = await archive.readState();
-      if (state.status === "planning") {
+      if (state.status === "planning" || state.status === "waiting_checkpoint") {
         if (error instanceof MadError && error.code === "CANCELLED") await archive.setStatus("cancelled");
         else if (error instanceof MadError && error.code === "PAUSED") await archive.setStatus("paused");
         else await archive.setStatus("failed");
@@ -584,7 +647,7 @@ async function resume(args: readonly string[]): Promise<void> {
     const terminalAvailable = Boolean(process.stdin.isTTY && process.stderr.isTTY);
     const observerAvailable = await observerIsOnline(paths.runtime);
     if (manifest.interaction === "guided" && !terminalAvailable && !observerAvailable) {
-      throw new MadError("USAGE", "恢复 guided 审议需要交互终端或在线观察服务");
+      throw new MadError("USAGE", "恢复 guided 审议需要交互终端或在线审议控制台");
     }
     const cwd = manifest.workspace?.path ?? join(paths.runtime, "scratch", id);
     if (!manifest.workspace) await ensurePrivateDirectory(cwd);
@@ -600,8 +663,8 @@ async function resume(args: readonly string[]): Promise<void> {
     if (!plan) {
       const planning = manifest.planning;
       if (!planning) throw new MadError("EXECUTION", `审议 ${id} 缺少可恢复的组局状态`);
-      if (!planning.autoConfirmPlan && !terminalAvailable) {
-        throw new MadError("USAGE", "恢复方案确认需要交互终端");
+      if (!planning.autoConfirmPlan && !terminalAvailable && !observerAvailable) {
+        throw new MadError("USAGE", "恢复方案确认需要交互终端或在线审议控制台");
       }
       await archive.setStatus("planning");
       const organizerRunner = new InvocationRunner(
@@ -612,6 +675,7 @@ async function resume(args: readonly string[]): Promise<void> {
       organizerRunner.setContextBudget(planning.limits.contextBudget);
       const organizerService = new OrganizerService(registry, createAdapter, organizerRunner);
       let generation = planning.generation;
+      let candidateVersion = planning.candidateVersion ?? 0;
       let candidate = planning.candidatePlan;
       if (!candidate) {
         const proposed = await organizerService.propose({
@@ -631,7 +695,7 @@ async function resume(args: readonly string[]): Promise<void> {
       } else {
         await organizerService.preflightPlan(candidate, cwd, interrupt.signal, planning.projectMode);
       }
-      plan = manifest.interaction === "guided" && !planning.autoConfirmPlan
+      plan = !planning.autoConfirmPlan
         ? await confirmPlan(candidate, organizerService, {
           registry,
           question: manifest.question,
@@ -641,12 +705,17 @@ async function resume(args: readonly string[]): Promise<void> {
           cwd,
           projectMode: planning.projectMode,
           signal: interrupt.signal,
+          mailbox: new CheckpointMailbox(paths.runtime, id),
+          archive,
+          terminalAvailable,
           initialGeneration: generation,
-          onCandidate: async (candidatePlan, nextGeneration) => {
+          initialVersion: candidateVersion,
+          onCandidate: async (candidatePlan, nextGeneration, nextVersion) => {
             generation = nextGeneration;
+            candidateVersion = nextVersion;
             manifest = {
               ...manifest,
-              planning: { ...planning, candidatePlan, generation: nextGeneration },
+              planning: { ...planning, candidatePlan, generation: nextGeneration, candidateVersion: nextVersion },
             };
             await archive.writeManifest(manifest);
           },
@@ -655,7 +724,7 @@ async function resume(args: readonly string[]): Promise<void> {
       manifest = {
         ...manifest,
         plan,
-        planning: { ...planning, candidatePlan: plan, generation },
+        planning: { ...planning, candidatePlan: plan, generation, candidateVersion },
         planConfirmation: planning.autoConfirmPlan ? "auto-first-valid" : "interactive",
       };
       await archive.writeManifest(manifest);
@@ -699,7 +768,7 @@ async function resume(args: readonly string[]): Promise<void> {
     process.stderr.write(`审议档案：${archive.path}\n`);
   } catch (error) {
     const current = await archive.readState();
-    if (current.status === "planning") {
+    if (current.status === "planning" || current.status === "waiting_checkpoint") {
       if (error instanceof MadError && error.code === "CANCELLED") await archive.setStatus("cancelled");
       else if (error instanceof MadError && error.code === "PAUSED") await archive.setStatus("paused");
       else await archive.setStatus("failed");
@@ -716,7 +785,7 @@ async function serve(args: readonly string[]): Promise<void> {
   const port = Number.parseInt(parsed.values.port, 10);
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new MadError("USAGE", "--port 必须是 0 到 65535 的整数");
   const { observer, browserError } = await launchObserverPage(appPaths(), port);
-  process.stderr.write(`审议观察页：${observer.url}\n服务仅监听 127.0.0.1；Bearer Token 只存在于本进程与 URL fragment。\n`);
+  process.stderr.write(`审议控制台：${observer.url}\n服务仅监听 127.0.0.1；Bearer Token 只存在于本进程与 URL fragment。\n`);
   if (browserError) process.stderr.write(`未能自动打开浏览器：${browserError.message}\n请手动打开上方完整地址。\n`);
   await new Promise<void>((resolve) => {
     const stop = (): void => resolve();
