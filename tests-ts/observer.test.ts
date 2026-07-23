@@ -10,6 +10,55 @@ import { observerIsOnline } from "../src/server/mailbox.js";
 import { launchObserverPage } from "../src/server/launch.js";
 import { APP_JS, INDEX_HTML, STYLES_CSS, WEB_ASSET_VERSION } from "../src/web/index.js";
 
+interface ObserverUiTestApi {
+  transcriptHtml(records: unknown[]): string;
+  timelineHtml(data: Record<string, unknown>): string;
+  outcomeHtml(data: Record<string, unknown>): string;
+  appendStreamEvent(event: Record<string, unknown>): void;
+  navigateTimelineTarget(targetId: string): void;
+  refreshTranscript(id: string): Promise<void>;
+  setArchiveState(id: string, data: Record<string, unknown>): void;
+}
+
+function loadObserverUiTestApi(
+  documentOverrides: Record<string, unknown> = {},
+  browserOverrides: { fetch?: (...args: unknown[]) => Promise<unknown> } = {},
+): ObserverUiTestApi {
+  const testApi: Partial<ObserverUiTestApi> = {};
+  const storage = () => {
+    const values = new Map<string, string>();
+    return {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    };
+  };
+  const document = {
+    querySelector: () => null,
+    getElementById: () => null,
+    ...documentOverrides,
+  };
+  const browserGlobal = { __MAD_OBSERVER_TEST__: testApi };
+  const evaluate = new Function(
+    "document", "location", "sessionStorage", "localStorage", "history", "window",
+    "requestAnimationFrame", "getComputedStyle", "fetch", "navigator", "globalThis", APP_JS,
+  );
+  evaluate(
+    document,
+    { hash: "", pathname: "/" },
+    storage(),
+    storage(),
+    { replaceState: () => undefined },
+    {},
+    (callback: () => void) => callback(),
+    () => ({ display: "block" }),
+    browserOverrides.fetch ?? (() => Promise.reject(new Error("unexpected fetch"))),
+    { clipboard: { writeText: () => Promise.resolve() } },
+    browserGlobal,
+  );
+  return testApi as ObserverUiTestApi;
+}
+
 describe("authenticated observer service", () => {
   it("serves browser JavaScript that parses successfully", () => {
     expect(() => new Function(APP_JS)).not.toThrow();
@@ -25,29 +74,106 @@ describe("authenticated observer service", () => {
     expect(STYLES_CSS).toContain("position:sticky");
   });
 
-  it("separates agent content from programmatic flow without requiring model changes", () => {
-    expect(APP_JS).toContain("processStages=new Set");
-    expect(APP_JS).toContain("process-output");
-    expect(APP_JS).toContain("body-output");
-    expect(APP_JS).toContain("运行信息");
-    expect(APP_JS).toContain("record.logicalCallId");
-    expect(APP_JS).toContain("r.contentHtml");
+  it("renders body and programmatic output as distinct structures", () => {
+    const ui = loadObserverUiTestApi();
+    const html = ui.transcriptHtml([
+      { id: "body-1", stage: "independent", agentId: "analyst", at: "2026-07-23T10:00:00Z", contentHtml: "<p>正文</p>" },
+      { id: "flow-1", stage: "planning", agentId: "planner", at: "2026-07-23T10:01:00Z", contentHtml: "<pre>流程</pre>" },
+    ]);
+
+    expect(html).toContain('id="output-body-1" class="transcript-entry body-output"');
+    expect(html).toContain('id="output-flow-1" class="transcript-entry process-output"');
+    expect(html).toContain('<details class="process-details">');
+    expect(html).toContain("正文 · 独立陈述");
+    expect(html).toContain("流程 · 候选方案规划");
   });
 
-  it("builds timeline anchors from existing transcript and event fields", () => {
-    expect(APP_JS).toContain("function timelineHtml(data)");
-    expect(APP_JS).toContain("r.id||r.logicalCallId");
-    expect(APP_JS).toContain("anchorId('event',e.id,index)");
-    expect(APP_JS).toContain("IntersectionObserver");
-    expect(APP_JS).toContain("显示流程");
-    expect(APP_JS).toContain("archiveHash(targetId)");
-    expect(APP_JS).toContain("initialArchive=fragment.get('archive')");
+  it("renders timeline anchors and binds a streamed event for navigation", () => {
+    let insertedEvent = "";
+    let insertedTimeline = "";
+    let scrolled = false;
+    const processLog = { open: false };
+    const target = {
+      closest: () => processLog,
+      scrollIntoView: () => { scrolled = true; },
+    };
+    const streamedLink: { dataset: { target: string }; onclick?: (event: { preventDefault(): void }) => void } = {
+      dataset: { target: "event-stream-1" },
+    };
+    const events = { insertAdjacentHTML: (_position: string, html: string) => { insertedEvent = html; } };
+    const timeline = {
+      lastElementChild: streamedLink,
+      insertAdjacentHTML: (_position: string, html: string) => { insertedTimeline = html; },
+    };
+    const rail = { classList: { remove: () => undefined } };
+    const ui = loadObserverUiTestApi({
+      querySelector: (selector: string) => ({ "#events": events, ".timeline-list": timeline, ".anchor-rail": rail }[selector] ?? null),
+      getElementById: (id: string) => id === "event-stream-1" ? target : null,
+    });
+
+    const timelineHtml = ui.timelineHtml({
+      manifest: { createdAt: "2026-07-23T10:00:00Z" },
+      state: {}, checkpoint: null, report: "",
+      transcript: [{ id: "body-1", stage: "independent", agentId: "analyst", at: "2026-07-23T10:01:00Z" }],
+      events: [{ id: "old-1", type: "round.started", at: "2026-07-23T10:02:00Z" }],
+    });
+    expect(timelineHtml).toContain('data-target="output-body-1"');
+    expect(timelineHtml).toContain('data-target="event-old-1"');
+
+    ui.appendStreamEvent({ id: "stream-1", type: "round.completed", at: "2026-07-23T10:03:00Z" });
+    expect(insertedEvent).toContain('id="event-stream-1"');
+    expect(insertedTimeline).toContain('data-target="event-stream-1"');
+    expect(streamedLink.onclick).toBeTypeOf("function");
+    streamedLink.onclick?.({ preventDefault: () => undefined });
+    expect(processLog.open).toBe(true);
+    expect(scrolled).toBe(true);
+  });
+
+  it("merges events received during a transcript refresh and rejects stale archive writes", async () => {
+    const transcript = { innerHTML: "" };
+    const events = { innerHTML: "" };
+    const detail = { querySelector: () => null, querySelectorAll: () => [] };
+    let resolveSecond: ((response: unknown) => void) | undefined;
+    const snapshots = [
+      Promise.resolve({
+        ok: true,
+        headers: { get: () => "application/json" },
+        json: async () => ({
+          manifest: { createdAt: "2026-07-23T10:00:00Z" }, state: {}, checkpoint: null, report: "",
+          transcript: [], events: [{ id: "snapshot-1", type: "snapshot", at: "2026-07-23T10:01:00Z" }],
+        }),
+      }),
+      new Promise(resolve => { resolveSecond = resolve; }),
+    ];
+    const ui = loadObserverUiTestApi({
+      querySelector: (selector: string) => ({ "#detail": detail, "#transcript": transcript, "#events": events }[selector] ?? null),
+    }, { fetch: async () => snapshots.shift()! });
+    ui.setArchiveState("archive-a", {
+      events: [{ id: "live-1", type: "live", at: "2026-07-23T10:02:00Z" }],
+    });
+
+    await ui.refreshTranscript("archive-a");
+    expect(events.innerHTML).toContain("snapshot");
+    expect(events.innerHTML).toContain("live");
+
+    const staleRefresh = ui.refreshTranscript("archive-a");
+    ui.setArchiveState("archive-b", { events: [] });
+    resolveSecond?.({
+      ok: true,
+      headers: { get: () => "application/json" },
+      json: async () => ({
+        manifest: { createdAt: "2026-07-23T10:00:00Z" }, state: {}, checkpoint: null, report: "",
+        transcript: [], events: [{ id: "stale-1", type: "stale", at: "2026-07-23T10:03:00Z" }],
+      }),
+    });
+    await staleRefresh;
+    expect(events.innerHTML).not.toContain("stale");
   });
 
   it("omits the outcome section when the archive has no report", () => {
-    expect(APP_JS).toContain("hasOutcome=Boolean(data.report?.trim())");
-    expect(APP_JS).toContain("const outcomeSection=hasOutcome?");
-    expect(APP_JS).not.toContain("尚未生成最终报告");
+    const ui = loadObserverUiTestApi();
+    expect(ui.outcomeHtml({ report: "", reportHtml: "" })).toBe("");
+    expect(ui.outcomeHtml({ report: "# 结论", reportHtml: "<h1>结论</h1>" })).toContain('id="outcome"');
   });
 
   it("opens the authenticated observer URL after starting the service", async () => {
