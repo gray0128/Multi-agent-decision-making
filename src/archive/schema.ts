@@ -167,6 +167,9 @@ export function parseDeliberationManifest(value: unknown): DeliberationManifest 
         allowRegeneration: boolean(planning.allowRegeneration, "manifest.planning.allowRegeneration"),
         projectMode: boolean(planning.projectMode, "manifest.planning.projectMode"),
         generation: integer(planning.generation, "manifest.planning.generation", 0),
+        ...(planning.candidateVersion === undefined
+          ? {}
+          : { candidateVersion: integer(planning.candidateVersion, "manifest.planning.candidateVersion", 0) }),
         ...(planning.candidatePlan === undefined
           ? {}
           : { candidatePlan: plan(planning.candidatePlan, mode, "manifest.planning.candidatePlan") }),
