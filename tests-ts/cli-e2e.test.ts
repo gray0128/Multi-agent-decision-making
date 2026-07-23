@@ -393,6 +393,85 @@ describe("mad CLI end to end", () => {
     }
   }, 20_000);
 
+  it("pauses a web planning checkpoint on Ctrl-C and releases the active lock", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-cli-web-pause-"));
+    await configure(home);
+    const observer = await startObserverServer(appPaths(home));
+    const id = "web-pause-1";
+    const child = spawn(process.execPath, [
+      "--import", "tsx", cli, "deliberate", "暂停网页规划", "--auto", "--web-plan", "--id", id,
+    ], {
+      cwd: root,
+      env: { ...process.env, MAD_HOME: home },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const stderr: Buffer[] = [];
+    child.stderr.on("data", (chunk: Buffer) => stderr.push(chunk));
+    try {
+      const authorization = { Authorization: `Bearer ${observer.token}` };
+      let checkpointReady = false;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const response = await fetch(`http://127.0.0.1:${observer.port}/api/deliberations/${id}`, { headers: authorization });
+        if (response.ok) {
+          const data = await response.json() as { checkpoint?: { kind?: string } };
+          if (data.checkpoint?.kind === "plan_confirmation") { checkpointReady = true; break; }
+        }
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      }
+      expect(checkpointReady).toBe(true);
+      child.kill("SIGINT");
+      const code = await Promise.race([
+        new Promise<number>((resolveCode, reject) => {
+          child.once("error", reject);
+          child.once("close", (value) => resolveCode(value ?? -1));
+        }),
+        new Promise<number>((resolveCode) => setTimeout(() => resolveCode(-999), 2_000)),
+      ]);
+      if (code === -999) child.kill("SIGKILL");
+      expect(code, Buffer.concat(stderr).toString("utf8")).toBe(20);
+      expect(await readFile(join(home, "deliberations", id, "state.json"), "utf8")).toContain('"status": "paused"');
+      await expect(readFile(join(home, "runtime", "active.lock"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+
+      const resumed = spawn(process.execPath, ["--import", "tsx", cli, "resume", id, "--format", "json"], {
+        cwd: root,
+        env: { ...process.env, MAD_HOME: home },
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const resumedStdout: Buffer[] = [];
+      const resumedStderr: Buffer[] = [];
+      resumed.stdout.on("data", (chunk: Buffer) => resumedStdout.push(chunk));
+      resumed.stderr.on("data", (chunk: Buffer) => resumedStderr.push(chunk));
+      let resumedCheckpoint: { checkpointId: string; data: { candidateVersion: number } } | undefined;
+      for (let attempt = 0; attempt < 200; attempt += 1) {
+        const response = await fetch(`http://127.0.0.1:${observer.port}/api/deliberations/${id}`, { headers: authorization });
+        if (response.ok) {
+          const data = await response.json() as { checkpoint?: typeof resumedCheckpoint };
+          if (data.checkpoint?.data) { resumedCheckpoint = data.checkpoint; break; }
+        }
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 25));
+      }
+      expect(resumedCheckpoint).toBeTruthy();
+      expect((await fetch(`http://127.0.0.1:${observer.port}/api/checkpoints/${id}/respond`, {
+        method: "POST",
+        headers: { ...authorization, "Content-Type": "application/json" },
+        body: JSON.stringify({
+          checkpointId: resumedCheckpoint!.checkpointId,
+          action: "confirm",
+          candidateVersion: resumedCheckpoint!.data.candidateVersion,
+        }),
+      })).status).toBe(202);
+      const resumedCode = await new Promise<number>((resolveCode, reject) => {
+        resumed.once("error", reject);
+        resumed.once("close", (value) => resolveCode(value ?? -1));
+      });
+      expect(resumedCode, Buffer.concat(resumedStderr).toString("utf8")).toBe(0);
+      expect(JSON.parse(Buffer.concat(resumedStdout).toString("utf8"))).toMatchObject({ status: "completed" });
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await observer.close();
+    }
+  }, 20_000);
+
   it("launches a detached planning process from the authenticated console HTTP boundary", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-cli-console-launch-"));
     await configure(home);
@@ -425,7 +504,7 @@ describe("mad CLI end to end", () => {
         headers: authorization,
         body: JSON.stringify({
           requestId: "console-e2e-request",
-          topic: "控制台独立进程",
+          topic: "--auto",
           mode: "structured",
           interaction: "auto",
         }),

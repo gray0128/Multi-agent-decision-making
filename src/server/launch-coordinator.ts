@@ -22,6 +22,7 @@ export interface LaunchRecord {
   readonly deliberationId: string;
   readonly status: "reserved" | "spawned" | "planning" | "finished" | "failed";
   readonly createdAt: string;
+  readonly errorCode?: "SPAWN_FAILED" | "ARCHIVE_NOT_READY" | "DELIBERATION_FAILED";
   readonly error?: string;
 }
 
@@ -53,7 +54,6 @@ export function defaultProcessLauncher(paths: AppPaths): DeliberationProcessLaun
       ...process.execArgv,
       entry,
       "deliberate",
-      request.topic,
       "--mode",
       request.mode,
       "--id",
@@ -77,6 +77,7 @@ export function defaultProcessLauncher(paths: AppPaths): DeliberationProcessLaun
         args.push("--global-concurrency", String(request.limits.globalConcurrency));
       }
     }
+    args.push("--", request.topic);
     const child = spawn(process.execPath, args, {
       detached: true,
       stdio: "ignore",
@@ -113,7 +114,7 @@ export class LaunchCoordinator {
     try {
       const record = JSON.parse(await readFile(this.recordPath(requestId), "utf8")) as LaunchRecord;
       const resolved = await this.withArchiveStatus(record);
-      if (resolved.status !== record.status) await atomicJson(this.recordPath(requestId), resolved);
+      if (JSON.stringify(resolved) !== JSON.stringify(record)) await atomicJson(this.recordPath(requestId), resolved);
       return resolved;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
@@ -121,11 +122,15 @@ export class LaunchCoordinator {
     }
   }
 
+  public async currentDeliberationId(exceptRequestId = ""): Promise<string | null> {
+    return await this.activeDeliberationId() ?? await this.pendingDeliberationId(exceptRequestId);
+  }
+
   private async launchExclusive(request: WebLaunchRequest): Promise<LaunchRecord> {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
     const existing = await this.read(request.requestId);
     if (existing) return existing;
-    const active = await this.activeDeliberationId() ?? await this.pendingDeliberationId(request.requestId);
+    const active = await this.currentDeliberationId(request.requestId);
     if (active) throw new ActiveLaunchConflict(active);
     const record: LaunchRecord = {
       requestId: request.requestId,
@@ -151,6 +156,7 @@ export class LaunchCoordinator {
       const failed: LaunchRecord = {
         ...record,
         status: "failed",
+        errorCode: "SPAWN_FAILED",
         error: redactAdapterDiagnostic(error instanceof Error ? error.message : String(error)),
       };
       await atomicJson(this.recordPath(request.requestId), failed);
@@ -159,19 +165,33 @@ export class LaunchCoordinator {
   }
 
   private async withArchiveStatus(record: LaunchRecord): Promise<LaunchRecord> {
-    if (record.status === "failed") return record;
+    const archiveNotReady = record.errorCode === "ARCHIVE_NOT_READY" ||
+      (record.errorCode === undefined && record.error === "审议进程未能在期限内建立规划档案");
+    if (record.status === "failed" && !archiveNotReady) return record;
     try {
       const state = await new ArchiveStore(this.paths.deliberations, record.deliberationId).readState();
       if (state.status === "failed") {
-        return { ...record, status: "failed", error: "审议进程在规划阶段失败；请查看脱敏档案诊断" };
+        return {
+          ...record,
+          status: "failed",
+          errorCode: "DELIBERATION_FAILED",
+          error: "审议进程在规划阶段失败；请查看脱敏档案诊断",
+        };
       }
+      const { error: _error, errorCode: _errorCode, ...recovered } = record;
       return {
-        ...record,
+        ...recovered,
         status: ["completed", "cancelled", "paused"].includes(state.status) ? "finished" : "planning",
       };
     } catch {
+      if (record.status === "failed" && archiveNotReady) return record;
       if (Date.now() - Date.parse(record.createdAt) > 10_000) {
-        return { ...record, status: "failed", error: "审议进程未能在期限内建立规划档案" };
+        return {
+          ...record,
+          status: "failed",
+          errorCode: "ARCHIVE_NOT_READY",
+          error: "审议进程未能在期限内建立规划档案",
+        };
       }
       return record;
     }
@@ -196,12 +216,23 @@ export class LaunchCoordinator {
   }
 
   private async pendingDeliberationId(exceptRequestId: string): Promise<string | null> {
-    for (const name of await readdir(this.directory)) {
+    let names: string[];
+    try {
+      names = await readdir(this.directory);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+    for (const name of names) {
       if (!name.endsWith(".json") || name === `${exceptRequestId}.json`) continue;
       try {
         const record = JSON.parse(await readFile(join(this.directory, name), "utf8")) as LaunchRecord;
         const resolved = await this.withArchiveStatus(record);
-        if (resolved.status === "reserved" || resolved.status === "spawned") {
+        if (
+          resolved.status === "reserved" ||
+          resolved.status === "spawned" ||
+          resolved.errorCode === "ARCHIVE_NOT_READY"
+        ) {
           return resolved.deliberationId;
         }
       } catch { /* ignore malformed or concurrently replaced coordination records */ }

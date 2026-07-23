@@ -63,7 +63,9 @@ export class CheckpointMailbox {
     await rename(temporary, this.requestPath);
     await onPublished?.(checkpointId);
     const abort = new AbortController();
-    const onExternalAbort = (): void => { void this.submit(checkpointId, "pause"); };
+    const onExternalAbort = (): void => {
+      if (pending.actions.includes("pause")) void this.submit(checkpointId, "pause");
+    };
     signal?.addEventListener("abort", onExternalAbort, { once: true });
     if (signal?.aborted) onExternalAbort();
     let localError: unknown;

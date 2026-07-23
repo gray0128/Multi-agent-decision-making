@@ -226,7 +226,7 @@ async function confirmPlan(
     const pending = {
       kind: "plan_confirmation",
       summary: validationError || "候选审议方案等待确认",
-      actions: ["confirm", "replace", "regroup", "cancel"],
+      actions: ["confirm", "replace", "regroup", "pause", "cancel"],
       data: { candidatePlan: externalPlan(plan), generation, candidateVersion: version, validationError },
     } as const;
     const state = await context.archive.readState();
@@ -275,6 +275,7 @@ async function confirmPlan(
       candidateVersion: version,
     });
     if (response.action === "confirm") return plan;
+    if (response.action === "pause") throw new MadError("PAUSED", "已暂停审议");
     if (response.action === "cancel") throw new MadError("CANCELLED", "已取消审议");
     validationError = "";
     if (response.action === "regroup") {

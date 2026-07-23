@@ -40,6 +40,15 @@ describe("authenticated observer service", () => {
     expect(APP_JS).toContain("d.message");
   });
 
+  it("extracts messages from JSON API errors", () => {
+    expect(APP_JS).toContain("content-type");
+    expect(APP_JS).toContain("payload.message||payload.error||payload.code");
+  });
+
+  it("distinguishes a rejected plan edit from the last valid candidate", () => {
+    expect(APP_JS).toContain("本次修改未通过校验；上一版候选方案仍有效。");
+  });
+
   it("exposes authenticated safe launch options and the three-step entry", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-launch-options-"));
     const paths = appPaths(home);
@@ -88,6 +97,99 @@ describe("authenticated observer service", () => {
     }
   });
 
+  it("reports an in-flight launch as active before the CLI acquires its lock", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-launch-pending-options-"));
+    const paths = appPaths(home);
+    await mkdir(join(paths.runtime, "launches"), { recursive: true });
+    await writeFile(join(paths.runtime, "launches", "pending-request.json"), JSON.stringify({
+      requestId: "pending-request",
+      deliberationId: "pending-deliberation",
+      status: "spawned",
+      createdAt: new Date().toISOString(),
+    }));
+    const observer = await startObserverServer(paths, 0, {
+      loadRegistry: async () => ({
+        defaults: { generator: { cli: "codex", preset: "deep" } },
+        clis: [{
+          id: "codex", adapter: "codex", executable: "codex", timeoutSeconds: 300, maxConcurrency: 1,
+          presets: [{ id: "deep", model: "gpt-safe", contextBudget: 64_000, options: {} }],
+        }],
+      }),
+      checkInvocation: async () => ({ ready: true }),
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${observer.port}/api/launch-options`, {
+        headers: { Authorization: `Bearer ${observer.token}` },
+      });
+      expect(await response.json()).toMatchObject({
+        activeDeliberation: { id: "pending-deliberation" },
+        canLaunch: false,
+      });
+    } finally {
+      await observer.close();
+    }
+  });
+
+  it("returns a redacted JSON envelope for unexpected API failures", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-observer-error-envelope-"));
+    const observer = await startObserverServer(appPaths(home), 0, {
+      loadRegistry: async () => { throw new Error("token=unexpected-secret registry failed"); },
+    });
+    try {
+      const response = await fetch(`http://127.0.0.1:${observer.port}/api/launch-options`, {
+        headers: { Authorization: `Bearer ${observer.token}` },
+      });
+      expect(response.status).toBe(500);
+      expect(response.headers.get("content-type")).toContain("application/json");
+      const text = await response.text();
+      expect(text).not.toContain("unexpected-secret");
+      expect(JSON.parse(text)).toMatchObject({ code: "INTERNAL_ERROR", message: expect.stringContaining("[REDACTED]") });
+    } finally {
+      await observer.close();
+    }
+  });
+
+  it("rejects an invalid workspace before creating a launch record or spawning", async () => {
+    const home = await mkdtemp(join(tmpdir(), "mad-launch-workspace-validation-"));
+    const paths = appPaths(home);
+    const workspaceFile = join(home, "not-a-directory.txt");
+    await writeFile(workspaceFile, "not a directory");
+    let spawnCount = 0;
+    const observer = await startObserverServer(paths, 0, {
+      loadRegistry: async () => ({
+        defaults: { generator: { cli: "codex", preset: "deep" } },
+        clis: [{
+          id: "codex", adapter: "codex", executable: "codex", timeoutSeconds: 300, maxConcurrency: 1,
+          presets: [{ id: "deep", model: "gpt-safe", contextBudget: 64_000, options: {} }],
+        }],
+      }),
+      launchDeliberation: async () => { spawnCount += 1; },
+    });
+    try {
+      const endpoint = `http://127.0.0.1:${observer.port}/api/launches`;
+      const headers = { Authorization: `Bearer ${observer.token}`, "Content-Type": "application/json" };
+      for (const [requestId, workspace] of [
+        ["relative-workspace", "relative/path"],
+        ["missing-workspace", join(home, "missing")],
+        ["file-workspace", workspaceFile],
+      ]) {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ requestId, topic: "检查工作目录", mode: "structured", workspace }),
+        });
+        expect(response.status).toBe(400);
+        expect(response.headers.get("content-type")).toContain("application/json");
+        expect(await response.json()).toMatchObject({ code: "INVALID_WORKSPACE", message: expect.any(String) });
+      }
+      expect(spawnCount).toBe(0);
+      await expect(readFile(join(paths.runtime, "launches", "relative-workspace.json"), "utf8"))
+        .rejects.toMatchObject({ code: "ENOENT" });
+    } finally {
+      await observer.close();
+    }
+  });
+
   it("idempotently launches an independent planning deliberation", async () => {
     const home = await mkdtemp(join(tmpdir(), "mad-web-launch-"));
     const paths = appPaths(home);
@@ -128,6 +230,9 @@ describe("authenticated observer service", () => {
       const endpoint = `http://127.0.0.1:${observer.port}/api/launches`;
       const authorization = { Authorization: `Bearer ${observer.token}`, "Content-Type": "application/json" };
       const payload = { requestId: "request-1", topic: "是否发布？", mode: "structured" };
+      const missing = await fetch(`${endpoint}/missing-request`, { headers: authorization });
+      expect(missing.status).toBe(404);
+      expect(await missing.json()).toMatchObject({ code: "LAUNCH_NOT_FOUND", message: expect.any(String) });
       expect((await fetch(endpoint, { method: "POST", body: JSON.stringify(payload) })).status).toBe(401);
       const first = await fetch(endpoint, { method: "POST", headers: authorization, body: JSON.stringify(payload) });
       expect(first.status).toBe(201);
@@ -198,6 +303,11 @@ describe("authenticated observer service", () => {
       const text = await response.text();
       expect(text).not.toContain("highly-secret");
       expect(text).toContain("[REDACTED]");
+      expect(JSON.parse(text)).toMatchObject({
+        code: "LAUNCH_FAILED",
+        message: expect.stringContaining("[REDACTED]"),
+        status: "failed",
+      });
       const persisted = await readFile(join(paths.runtime, "launches", "failed-request.json"), "utf8");
       expect(persisted).toContain('"status": "failed"');
       expect(persisted).not.toContain("highly-secret");

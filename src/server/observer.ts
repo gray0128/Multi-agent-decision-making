@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { randomBytes, timingSafeEqual } from "node:crypto";
-import { chmod, readFile, readdir, writeFile, rename, mkdir, unlink } from "node:fs/promises";
-import { join } from "node:path";
+import { chmod, readFile, readdir, realpath, stat, writeFile, rename, mkdir, unlink } from "node:fs/promises";
+import { isAbsolute, join } from "node:path";
 import { createAdapter } from "../adapters/index.js";
 import { loadCliRegistry, resolveInvocation, type CliRegistry } from "../adapters/config.js";
 import { redactAdapterDiagnostic } from "../adapters/redact.js";
@@ -45,6 +45,20 @@ function send(response: ServerResponse, status: number, body: string, type = "te
     "Referrer-Policy": "no-referrer",
   });
   response.end(body);
+}
+
+function sendError(
+  response: ServerResponse,
+  status: number,
+  code: string,
+  message: string,
+  details: Record<string, unknown> = {},
+): void {
+  send(response, status, JSON.stringify({
+    ...details,
+    code,
+    message: redactAdapterDiagnostic(message),
+  }), "application/json; charset=utf-8");
 }
 
 function authorized(request: IncomingMessage, token: string): boolean {
@@ -138,20 +152,6 @@ interface PublicLaunchCli {
   }[];
 }
 
-async function activeDeliberation(paths: AppPaths): Promise<{ id: string } | null> {
-  try {
-    const value = JSON.parse(await readFile(join(paths.runtime, "active.lock"), "utf8")) as {
-      deliberationId?: unknown;
-      pid?: unknown;
-    };
-    if (typeof value.deliberationId !== "string" || !Number.isSafeInteger(value.pid)) return null;
-    process.kill(value.pid as number, 0);
-    return { id: value.deliberationId };
-  } catch {
-    return null;
-  }
-}
-
 export async function startObserverServer(
   paths: AppPaths,
   port = 0,
@@ -170,7 +170,9 @@ export async function startObserverServer(
       if (request.method === "GET" && url.pathname === "/") return send(response, 200, INDEX_HTML, "text/html; charset=utf-8");
       if (request.method === "GET" && url.pathname === "/styles.css") return send(response, 200, STYLES_CSS, "text/css; charset=utf-8");
       if (request.method === "GET" && url.pathname === "/app.js") return send(response, 200, APP_JS, "text/javascript; charset=utf-8");
-      if (!url.pathname.startsWith("/api/") || !authorized(request, token)) return send(response, 401, "Unauthorized");
+      if (!url.pathname.startsWith("/api/") || !authorized(request, token)) {
+        return sendError(response, 401, "UNAUTHORIZED", "Unauthorized");
+      }
       if (request.method === "GET" && url.pathname === "/api/launch-options") {
         if (!launchOptionsCache || launchOptionsCache.expiresAt <= Date.now()) {
           const registry = await (dependencies.loadRegistry ?? (() => loadCliRegistry(paths.config)))();
@@ -203,7 +205,8 @@ export async function startObserverServer(
           launchOptionsCache = { expiresAt: Date.now() + 30_000, registry, clis };
         }
         const { registry, clis } = launchOptionsCache!;
-        const active = await activeDeliberation(paths);
+        const activeId = await coordinator.currentDeliberationId();
+        const active = activeId ? { id: activeId } : null;
         return send(response, 200, JSON.stringify({
           defaults: {
             mode: "structured",
@@ -223,71 +226,90 @@ export async function startObserverServer(
       const launchMatch = /^\/api\/launches\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && launchMatch) {
         const requestId = decodeURIComponent(launchMatch[1]!);
-        if (!REQUEST_ID.test(requestId)) return send(response, 400, "Invalid request id");
+        if (!REQUEST_ID.test(requestId)) return sendError(response, 400, "INVALID_REQUEST_ID", "Invalid request id");
         const record = await coordinator.read(requestId);
         return record
           ? send(response, 200, JSON.stringify(record), "application/json; charset=utf-8")
-          : send(response, 404, "Launch request not found");
+          : sendError(response, 404, "LAUNCH_NOT_FOUND", "Launch request not found");
       }
       if (request.method === "POST" && url.pathname === "/api/launches") {
         let payload: Record<string, unknown>;
         try { payload = await body(request); } catch (error) {
-          return send(response, 400, error instanceof Error ? error.message : String(error));
+          return sendError(response, 400, "INVALID_REQUEST_BODY", error instanceof Error ? error.message : String(error));
         }
         const allowed = ["requestId", "topic", "mode", "interaction", "workspace", "organizer", "limits"];
         const extras = Object.keys(payload).filter((key) => !allowed.includes(key));
-        if (extras.length) return send(response, 400, `Unknown fields: ${extras.join(", ")}`);
+        if (extras.length) return sendError(response, 400, "UNKNOWN_FIELDS", `Unknown fields: ${extras.join(", ")}`);
         if (typeof payload.requestId !== "string" || !REQUEST_ID.test(payload.requestId)) {
-          return send(response, 400, "Invalid request id");
+          return sendError(response, 400, "INVALID_REQUEST_ID", "Invalid request id");
         }
         const existing = await coordinator.read(payload.requestId);
         if (existing) {
           return send(response, 200, JSON.stringify(existing), "application/json; charset=utf-8");
         }
         if (typeof payload.topic !== "string" || !payload.topic.trim() || payload.topic.trim().length > 5_000) {
-          return send(response, 400, "topic must be 1 to 5000 characters");
+          return sendError(response, 400, "INVALID_TOPIC", "topic must be 1 to 5000 characters");
         }
-        if (payload.mode !== "structured" && payload.mode !== "free") return send(response, 400, "Invalid mode");
+        if (payload.mode !== "structured" && payload.mode !== "free") {
+          return sendError(response, 400, "INVALID_MODE", "Invalid mode");
+        }
         const interaction = payload.interaction ?? "guided";
-        if (interaction !== "guided" && interaction !== "auto") return send(response, 400, "Invalid interaction");
-        const active = await activeDeliberation(paths);
-        if (active) {
-          return send(response, 409, JSON.stringify({ code: "ACTIVE_DELIBERATION", activeDeliberation: active }), "application/json; charset=utf-8");
+        if (interaction !== "guided" && interaction !== "auto") {
+          return sendError(response, 400, "INVALID_INTERACTION", "Invalid interaction");
+        }
+        const activeId = await coordinator.currentDeliberationId(payload.requestId);
+        if (activeId) {
+          return sendError(response, 409, "ACTIVE_DELIBERATION", "当前 MAD_HOME 已有活动审议", {
+            activeDeliberation: { id: activeId },
+          });
         }
         const registry = await (dependencies.loadRegistry ?? (() => loadCliRegistry(paths.config)))();
         let organizer: WebLaunchRequest["organizer"];
         if (payload.organizer !== undefined) {
           if (typeof payload.organizer !== "object" || payload.organizer === null || Array.isArray(payload.organizer)) {
-            return send(response, 400, "organizer must be an object");
+            return sendError(response, 400, "INVALID_ORGANIZER", "organizer must be an object");
           }
           const value = payload.organizer as Record<string, unknown>;
           if (Object.keys(value).some((key) => !["cli", "preset"].includes(key)) ||
             typeof value.cli !== "string" || typeof value.preset !== "string") {
-            return send(response, 400, "Invalid organizer");
+            return sendError(response, 400, "INVALID_ORGANIZER", "Invalid organizer");
           }
           try { resolveInvocation(registry, value.cli, value.preset); } catch (error) {
-            return send(response, 400, error instanceof Error ? error.message : String(error));
+            return sendError(response, 400, "INVALID_ORGANIZER", error instanceof Error ? error.message : String(error));
           }
           organizer = { cli: value.cli, preset: value.preset };
         }
         let limits: WebLaunchRequest["limits"];
         if (payload.limits !== undefined) {
           if (typeof payload.limits !== "object" || payload.limits === null || Array.isArray(payload.limits)) {
-            return send(response, 400, "limits must be an object");
+            return sendError(response, 400, "INVALID_LIMITS", "limits must be an object");
           }
           const value = payload.limits as Record<string, unknown>;
           const limitKeys = ["maxParticipants", "maxCalls", "maxDiscussionWindows", "timeoutSeconds", "contextBudget", "globalConcurrency"];
-          if (Object.keys(value).some((key) => !limitKeys.includes(key))) return send(response, 400, "Invalid limits fields");
+          if (Object.keys(value).some((key) => !limitKeys.includes(key))) {
+            return sendError(response, 400, "INVALID_LIMITS", "Invalid limits fields");
+          }
           try { limits = resolveLimits(value); } catch (error) {
-            return send(response, 400, error instanceof Error ? error.message : String(error));
+            return sendError(response, 400, "INVALID_LIMITS", error instanceof Error ? error.message : String(error));
           }
         }
         let workspace: string | undefined;
         if (payload.workspace !== undefined) {
           if (typeof payload.workspace !== "string" || !payload.workspace.trim() || payload.workspace.length > 4_096) {
-            return send(response, 400, "Invalid workspace");
+            return sendError(response, 400, "INVALID_WORKSPACE", "Invalid workspace");
           }
-          workspace = payload.workspace.trim();
+          const requestedWorkspace = payload.workspace.trim();
+          if (!isAbsolute(requestedWorkspace)) {
+            return sendError(response, 400, "INVALID_WORKSPACE", "Workspace must be an absolute path");
+          }
+          try {
+            workspace = await realpath(requestedWorkspace);
+            if (!(await stat(workspace)).isDirectory()) {
+              return sendError(response, 400, "INVALID_WORKSPACE", "Workspace must be a directory");
+            }
+          } catch {
+            return sendError(response, 400, "INVALID_WORKSPACE", "Workspace does not exist or is not accessible");
+          }
         }
         const launchRequest: WebLaunchRequest = {
           requestId: payload.requestId,
@@ -303,14 +325,16 @@ export async function startObserverServer(
           record = await coordinator.launch(launchRequest);
         } catch (error) {
           if (error instanceof ActiveLaunchConflict) {
-            return send(response, 409, JSON.stringify({
-              code: "ACTIVE_DELIBERATION",
+            return sendError(response, 409, "ACTIVE_DELIBERATION", error.message, {
               activeDeliberation: { id: error.deliberationId },
-            }), "application/json; charset=utf-8");
+            });
           }
           throw error;
         }
         const status = record.status === "failed" ? 500 : record.status === "planning" ? 201 : 202;
+        if (record.status === "failed") {
+          return sendError(response, status, "LAUNCH_FAILED", record.error ?? "启动失败", { ...record });
+        }
         return send(response, status, JSON.stringify(record), "application/json; charset=utf-8");
       }
       if (request.method === "GET" && url.pathname === "/api/deliberations") {
@@ -333,11 +357,11 @@ export async function startObserverServer(
       const agentIdMatch = /^\/api\/deliberations\/([^/]+)\/agent-id$/.exec(url.pathname);
       if (request.method === "POST" && agentIdMatch) {
         const id = decodeURIComponent(agentIdMatch[1]!);
-        if (!ID.test(id)) return send(response, 400, "Invalid id");
+        if (!ID.test(id)) return sendError(response, 400, "INVALID_DELIBERATION_ID", "Invalid id");
         const archive = new ArchiveStore(paths.deliberations, id);
         const [manifest, state] = await Promise.all([archive.readManifest(), archive.readState()]);
         if (manifest.plan || !["planning", "waiting_checkpoint"].includes(state.status)) {
-          return send(response, 409, "Deliberation is not accepting plan edits");
+          return sendError(response, 409, "PLAN_EDITS_CLOSED", "Deliberation is not accepting plan edits");
         }
         const existing = new Set((manifest.planning?.candidatePlan?.participants ?? []).map((agent) => agent.id));
         let agentId = "";
@@ -347,13 +371,13 @@ export async function startObserverServer(
       const detailMatch = /^\/api\/deliberations\/([^/]+)$/.exec(url.pathname);
       if (request.method === "GET" && detailMatch) {
         const id = decodeURIComponent(detailMatch[1]!);
-        if (!ID.test(id)) return send(response, 400, "Invalid id");
+        if (!ID.test(id)) return sendError(response, 400, "INVALID_DELIBERATION_ID", "Invalid id");
         return send(response, 200, JSON.stringify(await detail(paths, id)), "application/json; charset=utf-8");
       }
       const eventsMatch = /^\/api\/deliberations\/([^/]+)\/events$/.exec(url.pathname);
       if (request.method === "GET" && eventsMatch) {
         const id = decodeURIComponent(eventsMatch[1]!);
-        if (!ID.test(id)) return send(response, 400, "Invalid id");
+        if (!ID.test(id)) return sendError(response, 400, "INVALID_DELIBERATION_ID", "Invalid id");
         let offset = Number.parseInt(url.searchParams.get("after") ?? "0", 10);
         if (!Number.isSafeInteger(offset) || offset < 0) offset = 0;
         response.writeHead(200, {
@@ -377,7 +401,7 @@ export async function startObserverServer(
       const respondMatch = /^\/api\/checkpoints\/([^/]+)\/respond$/.exec(url.pathname);
       if (request.method === "POST" && respondMatch) {
         const id = decodeURIComponent(respondMatch[1]!);
-        if (!ID.test(id)) return send(response, 400, "Invalid id");
+        if (!ID.test(id)) return sendError(response, 400, "INVALID_DELIBERATION_ID", "Invalid id");
         const requestPath = join(paths.runtime, "checkpoints", `${id}.request.json`);
         let pending: {
           checkpointId: string;
@@ -388,26 +412,28 @@ export async function startObserverServer(
         try {
           pending = await jsonFile(requestPath) as { checkpointId: string; actions: string[] };
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") return send(response, 409, "No current checkpoint");
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+            return sendError(response, 409, "NO_CURRENT_CHECKPOINT", "No current checkpoint");
+          }
           throw error;
         }
         let payload: Record<string, unknown>;
         try { payload = await body(request); } catch (error) {
-          return send(response, 400, error instanceof Error ? error.message : String(error));
+          return sendError(response, 400, "INVALID_REQUEST_BODY", error instanceof Error ? error.message : String(error));
         }
         const guidance = payload.guidance ?? "";
         if (pending.kind === "plan_confirmation") {
           const allowed = new Set(["checkpointId", "action", "candidateVersion", "guidance", "data"]);
           const extras = Object.keys(payload).filter((key) => !allowed.has(key));
-          if (extras.length) return send(response, 400, `Unknown fields: ${extras.join(", ")}`);
+          if (extras.length) return sendError(response, 400, "UNKNOWN_FIELDS", `Unknown fields: ${extras.join(", ")}`);
           if (payload.candidateVersion !== pending.data?.candidateVersion) {
-            return send(response, 409, "Stale candidate version");
+            return sendError(response, 409, "STALE_CANDIDATE_VERSION", "Stale candidate version");
           }
           if (payload.action === "replace" && (
             typeof payload.data !== "object" || payload.data === null || Array.isArray(payload.data)
-          )) return send(response, 400, "Replacement plan must be an object");
+          )) return sendError(response, 400, "INVALID_REPLACEMENT_PLAN", "Replacement plan must be an object");
           if (payload.action !== "replace" && payload.data !== undefined) {
-            return send(response, 400, "Checkpoint action does not accept plan data");
+            return sendError(response, 400, "UNEXPECTED_PLAN_DATA", "Checkpoint action does not accept plan data");
           }
         }
         if (
@@ -417,7 +443,7 @@ export async function startObserverServer(
           typeof guidance !== "string" ||
           guidance.length > 5_000
         ) {
-          return send(response, 409, "Stale or invalid checkpoint response");
+          return sendError(response, 409, "INVALID_CHECKPOINT_RESPONSE", "Stale or invalid checkpoint response");
         }
         const responsePath = join(paths.runtime, "checkpoints", `${id}.response.json`);
         if (!await publishExclusiveJson(responsePath, {
@@ -426,12 +452,17 @@ export async function startObserverServer(
           guidance,
           ...(payload.data === undefined ? {} : { data: payload.data }),
           at: new Date().toISOString(),
-        })) return send(response, 409, "Checkpoint already answered");
+        })) return sendError(response, 409, "CHECKPOINT_ALREADY_ANSWERED", "Checkpoint already answered");
         return send(response, 202, JSON.stringify({ accepted: true }), "application/json; charset=utf-8");
       }
-      return send(response, 404, "Not found");
+      return sendError(response, 404, "NOT_FOUND", "Not found");
     } catch (error) {
-      return send(response, 500, error instanceof Error ? error.message : String(error));
+      return sendError(
+        response,
+        500,
+        "INTERNAL_ERROR",
+        error instanceof Error ? error.message : String(error),
+      );
     }
   });
   await new Promise<void>((resolve, reject) => {
