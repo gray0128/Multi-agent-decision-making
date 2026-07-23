@@ -7,9 +7,33 @@ import { appPaths } from "../src/core/paths.js";
 import type { DeliberationManifest } from "../src/core/types.js";
 import { startObserverServer } from "../src/server/observer.js";
 import { observerIsOnline } from "../src/server/mailbox.js";
+import { launchObserverPage } from "../src/server/launch.js";
 import { APP_JS } from "../src/web/index.js";
 
 describe("authenticated observer service", () => {
+  it("serves browser JavaScript that parses successfully", () => {
+    expect(() => new Function(APP_JS)).not.toThrow();
+  });
+
+  it("opens the authenticated observer URL after starting the service", async () => {
+    const opened: string[] = [];
+    const observer = {
+      token: "secret",
+      port: 4321,
+      url: "http://127.0.0.1:4321/#token=secret",
+      close: async () => undefined,
+    };
+
+    const launched = await launchObserverPage(appPaths("/tmp/mad-observer-launch-test"), 0, {
+      start: async () => observer,
+      open: async (url) => { opened.push(url); },
+    });
+
+    expect(launched.observer).toBe(observer);
+    expect(launched.browserError).toBeUndefined();
+    expect(opened).toEqual([observer.url]);
+  });
+
   it("renders structured event details instead of dropping them", () => {
     expect(APP_JS).toContain("durationMs");
     expect(APP_JS).toContain("logicalCallId");

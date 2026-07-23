@@ -34,7 +34,7 @@ import type {
   InvocationConfigSnapshot,
   InvocationPresetRef,
 } from "../core/types.js";
-import { CheckpointMailbox, observerIsOnline, startObserverServer } from "../server/index.js";
+import { CheckpointMailbox, launchObserverPage, observerIsOnline } from "../server/index.js";
 import { emitWarnings, writeCompletedResult } from "./output.js";
 
 const HELP = `mad - 本地多 Agent 审议工具（TypeScript 迁移版）
@@ -715,8 +715,9 @@ async function serve(args: readonly string[]): Promise<void> {
   const parsed = parseArgs({ args, strict: true, options: { port: { type: "string", default: "0" } } });
   const port = Number.parseInt(parsed.values.port, 10);
   if (!Number.isSafeInteger(port) || port < 0 || port > 65_535) throw new MadError("USAGE", "--port 必须是 0 到 65535 的整数");
-  const observer = await startObserverServer(appPaths(), port);
+  const { observer, browserError } = await launchObserverPage(appPaths(), port);
   process.stderr.write(`审议观察页：${observer.url}\n服务仅监听 127.0.0.1；Bearer Token 只存在于本进程与 URL fragment。\n`);
+  if (browserError) process.stderr.write(`未能自动打开浏览器：${browserError.message}\n请手动打开上方完整地址。\n`);
   await new Promise<void>((resolve) => {
     const stop = (): void => resolve();
     process.once("SIGINT", stop);
